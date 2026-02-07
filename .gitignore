@@ -1,0 +1,29 @@
+# 가상환경
+venv/
+env/
+ENV/
+
+# Python 캐시
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# 출력 파일
+*.mp4
+*.avi
+*.mov
+output*.mp4
+result*.mp4
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+

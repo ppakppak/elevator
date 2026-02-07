@@ -1,0 +1,25 @@
+# DeepStream Primary GIE Configuration
+# 로컬 엔진 캐시 사용
+
+[property]
+gpu-id=0
+net-scale-factor=0.0039215697906911373
+model-file=/opt/nvidia/deepstream/deepstream/samples/models/Primary_Detector/resnet10.caffemodel
+proto-file=/opt/nvidia/deepstream/deepstream/samples/models/Primary_Detector/resnet10.prototxt
+# 절대 경로로 로컬에 엔진 저장
+model-engine-file=/home/ppak/projects/elevator/deepstream_pose/models/Primary_Detector/resnet10.caffemodel_b1_gpu0_int8.engine
+labelfile-path=/opt/nvidia/deepstream/deepstream/samples/models/Primary_Detector/labels.txt
+int8-calib-file=/opt/nvidia/deepstream/deepstream/samples/models/Primary_Detector/cal_trt.bin
+batch-size=1
+network-mode=1
+num-detected-classes=4
+interval=0
+gie-unique-id=1
+output-blob-names=conv2d_bbox;conv2d_cov/Sigmoid
+parse-bbox-func-name=NvDsInferParseCustomResnet
+custom-lib-path=/opt/nvidia/deepstream/deepstream/lib/libnvds_infercustomparser.so
+
+[class-attrs-all]
+pre-cluster-threshold=0.2
+eps=0.2
+group-threshold=1

@@ -1,0 +1,17 @@
+# DeepStream Pose Estimation Requirements
+
+# Core dependencies (usually pre-installed on Jetson)
+numpy>=1.19.0
+
+# trt_pose for model conversion (optional)
+# Install from: https://github.com/NVIDIA-AI-IOT/trt_pose
+# torch>=1.9.0
+# torchvision>=0.10.0
+# trt_pose
+
+# DeepStream Python bindings
+# pyds is typically installed with DeepStream SDK
+# See: https://github.com/NVIDIA-AI-IOT/deepstream_python_apps
+
+# GStreamer Python bindings (usually pre-installed)
+# PyGObject>=3.36.0
