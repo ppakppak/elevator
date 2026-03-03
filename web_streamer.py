@@ -358,7 +358,13 @@ class WebStreamer:
                 self.is_video_file = False
             except ValueError:
                 self.cap = cv2.VideoCapture(self.source)
-                self.is_video_file = True
+                source_str = str(self.source).lower()
+                # RTSP/HTTP 같은 실시간 스트림은 비디오 파일이 아님
+                self.is_video_file = not source_str.startswith(("rtsp://", "rtmp://", "http://", "https://", "udp://"))
+
+                # 실시간 스트림 지연 최소화 시도 (백엔드별 지원 여부는 다를 수 있음)
+                if not self.is_video_file:
+                    self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             
             if not self.cap.isOpened():
                 print(f"오류: 비디오 소스를 열 수 없습니다: {self.source}")
@@ -529,8 +535,13 @@ class WebStreamer:
                 with self.lock:
                     self.frame = frame.copy()
                 
-                # FPS 제어 (비디오 파일의 경우 원본 FPS 사용)
-                time.sleep(frame_delay)
+                # FPS 제어
+                # - 비디오 파일: 원본 FPS 맞춰 재생
+                # - 실시간 스트림: sleep 최소화해 지연 누적 방지
+                if self.is_video_file:
+                    time.sleep(frame_delay)
+                else:
+                    time.sleep(0.001)
         
         except Exception as e:
             print(f"비디오 처리 오류: {e}")
