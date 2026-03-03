@@ -177,12 +177,14 @@ class DeepStreamApp:
 
         # GStreamer 파이프라인 문자열 생성
         source = self.args.source
+        src_lower = source.lower()
+        is_live_uri = src_lower.startswith(("rtsp://", "rtmp://", "udp://", "http://", "https://"))
 
         if source.isdigit():
             # USB 카메라
+            sink_str = "fakesink sync=1" if self.args.no_display else "xvimagesink sync=0"
             pipeline_str = f"""
                 v4l2src device=/dev/video{source} !
-                video/x-raw, width=1280, height=720, framerate=30/1 !
                 videoconvert !
                 nvvideoconvert !
                 video/x-raw(memory:NVMM), format=NV12 !
@@ -194,22 +196,28 @@ class DeepStreamApp:
                 nvvideoconvert !
                 video/x-raw, format=BGRx !
                 videoconvert !
-                xvimagesink sync=0
+                {sink_str}
             """
         else:
-            # 파일/URI - 파일 싱크로 테스트하거나 X11 싱크 사용
+            # 파일/URI
             if self.args.no_display:
-                sink_str = "fakesink"
+                # 파일 소스 과속 방지를 위해 sync=1로 실시간에 가깝게 동작
+                sink_str = "fakesink sync=1"
             else:
-                # xvimagesink 사용 (더 안정적)
                 sink_str = "xvimagesink sync=0"
 
+            # 로컬 파일 경로면 file:// URI로 변환
+            uri = source
+            if "://" not in source and os.path.exists(source):
+                uri = "file://" + os.path.abspath(source)
+
+            live_flag = 1 if is_live_uri else 0
             pipeline_str = f"""
-                uridecodebin uri={source} !
+                uridecodebin uri={uri} !
                 nvvideoconvert !
                 video/x-raw(memory:NVMM), format=NV12 !
                 m.sink_0 nvstreammux name=m batch-size=1 width=1280 height=720
-                    batched-push-timeout={MUXER_BATCH_TIMEOUT_USEC} live-source=0 !
+                    batched-push-timeout={MUXER_BATCH_TIMEOUT_USEC} live-source={live_flag} !
                 nvinfer config-file-path={PGIE_CONFIG_FILE} !
                 nvvideoconvert !
                 nvdsosd name=osd !

@@ -20,10 +20,17 @@ class PreviewServer:
         self.lock = threading.Lock()
         self.frame_count = 0
         self.start_time = time.time()
+
+        src = str(source).lower()
+        self.is_live = src.isdigit() or src.startswith(("rtsp://", "rtmp://", "udp://", "http://", "https://"))
+
         self._setup_routes()
 
     def _open_capture(self):
-        self.cap = cv2.VideoCapture(self.source)
+        src = self.source
+        if str(src).isdigit():
+            src = int(src)
+        self.cap = cv2.VideoCapture(src)
         # low-latency hints (backend-dependent)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         self.cap.set(cv2.CAP_PROP_FPS, 15)
@@ -38,6 +45,12 @@ class PreviewServer:
 
             ok, frame = self.cap.read()
             if not ok:
+                # 파일 소스는 EOF 도달 시 처음으로 되감기
+                if not self.is_live and self.cap is not None and self.cap.isOpened():
+                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    time.sleep(0.01)
+                    continue
+
                 time.sleep(0.02)
                 continue
 
@@ -49,7 +62,11 @@ class PreviewServer:
                 self.frame = frame
                 self.frame_count += 1
 
-            time.sleep(0.001)
+            # 파일 재생은 과도한 CPU 사용 방지를 위해 속도 제한
+            if self.is_live:
+                time.sleep(0.001)
+            else:
+                time.sleep(1/15)
 
     def _setup_routes(self):
         @self.app.route('/')
