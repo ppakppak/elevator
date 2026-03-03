@@ -19,8 +19,7 @@ from typing import List, Tuple, Optional, Dict, Any
 
 import gi
 gi.require_version('Gst', '1.0')
-gi.require_version('GstRtspServer', '1.0')
-from gi.repository import Gst, GLib, GstRtspServer
+from gi.repository import Gst, GLib
 
 import numpy as np
 import pyds  # DeepStream Python bindings
