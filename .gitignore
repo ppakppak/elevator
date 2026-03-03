@@ -27,3 +27,7 @@ result*.mp4
 .DS_Store
 Thumbs.db
 
+
+# Runtime logs
+logs/
+deepstream_pose/logs/
