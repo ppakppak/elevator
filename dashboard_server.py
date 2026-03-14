@@ -21,6 +21,7 @@ import threading
 import time
 from collections import defaultdict, deque
 from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -238,6 +239,7 @@ HTML = """
 
 <script>
 const channels = {{ channels|tojson }};
+const pageToken = new URLSearchParams(location.search).get('token') || '';
 const state = {
   lastEventId: 0,
   lastRenderedTopId: 0,
@@ -268,6 +270,11 @@ function formatTime(ts){
 
 function escapeHtml(value){
   return String(value || '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+}
+
+function withToken(params){
+  if(pageToken) params.set('token', pageToken);
+  return params;
 }
 
 function initChannelFilterOptions(){
@@ -546,7 +553,7 @@ async function pollEvents(){
   try {
     const incremental = !hasActiveFilters();
     const params = buildEventQuery(incremental);
-    const r = await fetch(`/api/events?${params.toString()}`, {cache:'no-store'});
+    const r = await fetch(`/api/events?${withToken(params).toString()}`, {cache:'no-store'});
     if(!r.ok) throw new Error(`HTTP ${r.status}`);
     const j = await r.json();
     const events = Array.isArray(j.events) ? j.events : [];
@@ -588,7 +595,7 @@ function listHtml(title, data){
 async function pollStats(){
   try {
     const params = buildStatsQuery();
-    const r = await fetch(`/api/events/stats?${params.toString()}`, {cache:'no-store'});
+    const r = await fetch(`/api/events/stats?${withToken(params).toString()}`, {cache:'no-store'});
     if(!r.ok) throw new Error(`HTTP ${r.status}`);
     const j = await r.json();
     const s = j.stats || {};
@@ -664,6 +671,14 @@ def _parse_float(value: Optional[str]) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _extract_request_token() -> str:
+    """Extract token from Authorization header or `token` query parameter."""
+    auth = request.headers.get("Authorization", "").strip()
+    if auth.lower().startswith("bearer "):
+        return auth.split(" ", 1)[1].strip()
+    return (request.args.get("token") or "").strip()
 
 
 def infer_severity(event_type: str, score: float) -> str:
@@ -1115,6 +1130,10 @@ class AlertHub:
             "by_severity": dict(by_severity),
         }
 
+    def retry_queue_size(self) -> int:
+        with self._retry_lock:
+            return len(self._retry_items)
+
 
 def tail_file(path: str, on_line):
     p = Path(path)
@@ -1160,12 +1179,29 @@ def parse_line(channel_id: str, line: str, hub: AlertHub):
 
 def create_app(hub: AlertHub):
     app = Flask(__name__)
+    access_token = os.getenv("DASHBOARD_ACCESS_TOKEN", "").strip()
+    token_enabled = bool(access_token)
+
+    def token_required(view_func):
+        @wraps(view_func)
+        def _wrapped(*args, **kwargs):
+            if not token_enabled:
+                return view_func(*args, **kwargs)
+
+            provided = _extract_request_token()
+            if provided != access_token:
+                return jsonify({"error": "unauthorized", "message": "valid token required"}), 401
+            return view_func(*args, **kwargs)
+
+        return _wrapped
 
     @app.route("/")
+    @token_required
     def index():
         return render_template_string(HTML, channels=CHANNELS)
 
     @app.route("/api/events")
+    @token_required
     def api_events():
         since_id = _clamp_int(request.args.get("since_id") or request.args.get("since"), default=0, minimum=0, maximum=10**9)
         limit = _clamp_int(request.args.get("limit"), default=50, minimum=1, maximum=500)
@@ -1197,6 +1233,7 @@ def create_app(hub: AlertHub):
         return jsonify({"events": events, "count": len(events)})
 
     @app.route("/api/events/stats")
+    @token_required
     def api_event_stats():
         from_ts = _parse_float(request.args.get("from_ts"))
         to_ts = _parse_float(request.args.get("to_ts"))
@@ -1208,6 +1245,7 @@ def create_app(hub: AlertHub):
         })
 
     @app.route("/api/health")
+    @token_required
     def health():
         return jsonify(
             {
@@ -1217,6 +1255,8 @@ def create_app(hub: AlertHub):
                 "event_queue_size": len(hub.events),
                 "db_enabled": hub.db_enabled,
                 "last_event_ts": hub.last_event_ts,
+                "retry_queue_size": hub.retry_queue_size(),
+                "token_enabled": token_enabled,
             }
         )
 
