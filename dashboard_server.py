@@ -4,28 +4,55 @@ Elevator 4-channel dashboard + anomaly alert hub
 - 4-way preview grid (ports 5000~5003)
 - DeepStream log tailing (fall/fight events)
 - In-browser live alert feed + optional Telegram/webhook alerts
+
+API examples:
+- GET /api/events?since=120
+- GET /api/events?channel=rtsp&type=fall&severity=critical&min_score=0.85&limit=30
+- GET /api/events?from_ts=1710000000&to_ts=1710003600&q=신뢰도&sort=asc
+- GET /api/events/stats?from_ts=1710000000&to_ts=1710086400
 """
 
 import argparse
 import json
 import os
 import re
+import sqlite3
 import threading
 import time
-from collections import deque
-from datetime import datetime
+from collections import defaultdict, deque
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import requests
 from flask import Flask, jsonify, render_template_string, request
 
 
 CHANNELS = [
-    {"id": "webcam", "name": "Webcam", "port": 5000, "ds_log": "/home/ppak/projects/elevator/deepstream_pose/logs/elevator-ds-webcam.out.log"},
-    {"id": "rtsp", "name": "RTSP", "port": 5001, "ds_log": "/home/ppak/projects/elevator/deepstream_pose/logs/elevator-ds-rtsp.out.log"},
-    {"id": "video1", "name": "Video 1", "port": 5002, "ds_log": "/home/ppak/projects/elevator/deepstream_pose/logs/elevator-ds-video1.out.log"},
-    {"id": "video2", "name": "Video 2", "port": 5003, "ds_log": "/home/ppak/projects/elevator/deepstream_pose/logs/elevator-ds-video2.out.log"},
+    {
+        "id": "webcam",
+        "name": "Webcam",
+        "port": 5000,
+        "ds_log": "/home/ppak/projects/elevator/deepstream_pose/logs/elevator-ds-webcam.out.log",
+    },
+    {
+        "id": "rtsp",
+        "name": "RTSP",
+        "port": 5001,
+        "ds_log": "/home/ppak/projects/elevator/deepstream_pose/logs/elevator-ds-rtsp.out.log",
+    },
+    {
+        "id": "video1",
+        "name": "Video 1",
+        "port": 5002,
+        "ds_log": "/home/ppak/projects/elevator/deepstream_pose/logs/elevator-ds-video1.out.log",
+    },
+    {
+        "id": "video2",
+        "name": "Video 2",
+        "port": 5003,
+        "ds_log": "/home/ppak/projects/elevator/deepstream_pose/logs/elevator-ds-video2.out.log",
+    },
 ]
 
 FALL_RE = re.compile(r"\[쓰러짐 감지\].*신뢰도:\s*([0-9.]+)")
@@ -160,7 +187,7 @@ function addEvents(events){
     d.className = `ev ${ev.type}`;
     d.innerHTML = `
       <div class="line"><span class="pill ${ev.type}">${ev.type.toUpperCase()}</span> ${ev.channel_name}</div>
-      <div class="meta">score=${ev.score.toFixed(2)} | ${ev.time_str}</div>
+      <div class="meta">score=${ev.score.toFixed(2)} | ${ev.time_str} | ${ev.severity || 'warning'}</div>
       <div class="meta">${ev.raw_line || ''}</div>
     `;
     box.prepend(d);
@@ -198,13 +225,44 @@ tickClock();
 """
 
 
+def _clamp_int(value: Optional[str], default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value) if value is not None else default
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+def _parse_float(value: Optional[str]) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def infer_severity(event_type: str, score: float) -> str:
+    """Infer severity from event type and confidence score."""
+    event_type = (event_type or "").lower().strip()
+    if event_type == "fall":
+        return "critical" if score >= 0.9 else "warning"
+    if event_type == "fight":
+        return "critical" if score >= 0.85 else "warning"
+    return "normal"
+
+
 class AlertHub:
+    """Collect, persist, query, and relay anomaly events."""
+
     def __init__(self, cooldown_sec: int = 30, max_events: int = 500):
         self.cooldown_sec = cooldown_sec
         self.events = deque(maxlen=max_events)
         self.last_alert_at: Dict[str, float] = {}
         self._seq = 0
         self._lock = threading.Lock()
+        self.start_ts = time.time()
+        self.last_event_ts: Optional[float] = None
 
         # optional external alert targets
         self.telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -213,67 +271,425 @@ class AlertHub:
 
         self.channel_map = {c["id"]: c for c in CHANNELS}
 
+        # SQLite persistence
+        self.db_path = os.getenv("EVENT_DB_PATH", "events.db").strip() or "events.db"
+        self._db_lock = threading.Lock()
+        self.db_conn: Optional[sqlite3.Connection] = None
+        self.db_enabled = self._init_db()
+        self._load_recent_from_db(max_events)
+
+        # failed external alert retry queue
+        self._retry_items: List[Dict[str, Any]] = []
+        self._retry_lock = threading.Lock()
+        self._retry_thread = threading.Thread(target=self._retry_loop, daemon=True)
+        self._retry_thread.start()
+
+    def _init_db(self) -> bool:
+        try:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts REAL NOT NULL,
+                    time_str TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    severity TEXT NOT NULL,
+                    channel_id TEXT NOT NULL,
+                    channel_name TEXT NOT NULL,
+                    score REAL NOT NULL,
+                    source TEXT NOT NULL,
+                    raw_line TEXT,
+                    metadata_json TEXT
+                )
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_events_channel ON events(channel_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_events_severity ON events(severity)")
+            conn.commit()
+            self.db_conn = conn
+            return True
+        except Exception as exc:
+            print(f"[WARN] SQLite init failed: {exc}")
+            self.db_conn = None
+            return False
+
+    def _load_recent_from_db(self, limit: int):
+        if not self.db_enabled or not self.db_conn:
+            return
+        try:
+            with self._db_lock:
+                rows = self.db_conn.execute(
+                    """
+                    SELECT id, ts, time_str, event_type, severity, channel_id, channel_name, score, source, raw_line, metadata_json
+                    FROM events
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+                row_max_id = self.db_conn.execute("SELECT COALESCE(MAX(id), 0) AS max_id FROM events").fetchone()
+                self._seq = int(row_max_id["max_id"] if row_max_id else 0)
+
+            for row in rows:
+                self.events.append(self._row_to_event(row))
+
+            if self.events:
+                self.last_event_ts = max(event["timestamp"] for event in self.events)
+        except Exception as exc:
+            print(f"[WARN] Failed to bootstrap in-memory queue from DB: {exc}")
+
+    def _row_to_event(self, row: sqlite3.Row) -> Dict[str, Any]:
+        metadata = {}
+        metadata_json = row["metadata_json"]
+        if metadata_json:
+            try:
+                metadata = json.loads(metadata_json)
+            except Exception:
+                metadata = {}
+
+        return {
+            "id": int(row["id"]),
+            "event_type": row["event_type"],
+            "type": row["event_type"],  # backward compatibility
+            "severity": row["severity"],
+            "channel_id": row["channel_id"],
+            "channel": row["channel_id"],  # backward compatibility
+            "channel_name": row["channel_name"],
+            "score": float(row["score"]),
+            "timestamp": float(row["ts"]),
+            "time": float(row["ts"]),  # backward compatibility
+            "ts": float(row["ts"]),
+            "time_str": row["time_str"],
+            "source": row["source"],
+            "metadata": metadata,
+            "raw_line": row["raw_line"] or "",
+        }
+
     def _next_id(self) -> int:
         with self._lock:
             self._seq += 1
             return self._seq
 
     def _should_emit(self, channel_id: str, event_type: str, now: float) -> bool:
-        k = f"{channel_id}:{event_type}"
-        last = self.last_alert_at.get(k, 0)
+        key = f"{channel_id}:{event_type}"
+        last = self.last_alert_at.get(key, 0)
         if now - last < self.cooldown_sec:
             return False
-        self.last_alert_at[k] = now
+        self.last_alert_at[key] = now
         return True
 
-    def push(self, channel_id: str, event_type: str, score: float, raw_line: str):
+    def _persist_event(self, event: Dict[str, Any]) -> Optional[int]:
+        if not self.db_enabled or not self.db_conn:
+            return None
+        try:
+            metadata_json = json.dumps(event.get("metadata") or {}, ensure_ascii=False)
+            with self._db_lock:
+                cursor = self.db_conn.execute(
+                    """
+                    INSERT INTO events (ts, time_str, event_type, severity, channel_id, channel_name, score, source, raw_line, metadata_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event["timestamp"],
+                        event["time_str"],
+                        event["event_type"],
+                        event["severity"],
+                        event["channel_id"],
+                        event["channel_name"],
+                        event["score"],
+                        event["source"],
+                        event["raw_line"],
+                        metadata_json,
+                    ),
+                )
+                self.db_conn.commit()
+                return int(cursor.lastrowid)
+        except Exception as exc:
+            print(f"[WARN] Event persistence failed: {exc}")
+            return None
+
+    def push(self, channel_id: str, event_type: str, score: float, raw_line: str, source: str = "deepstream-log"):
         now = time.time()
         if not self._should_emit(channel_id, event_type, now):
             return
 
-        ch = self.channel_map.get(channel_id, {"name": channel_id})
+        channel = self.channel_map.get(channel_id, {"name": channel_id})
+        severity = infer_severity(event_type, score)
+        time_iso = datetime.fromtimestamp(now, tz=timezone.utc).astimezone().isoformat(timespec="seconds")
+
         event = {
-            "id": self._next_id(),
-            "time": now,
-            "time_str": datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M:%S"),
-            "channel": channel_id,
-            "channel_name": ch.get("name", channel_id),
-            "type": event_type,
+            "id": 0,  # assigned below
+            "event_type": event_type,
+            "type": event_type,  # backward compatibility
+            "severity": severity,
+            "channel_id": channel_id,
+            "channel": channel_id,  # backward compatibility
+            "channel_name": channel.get("name", channel_id),
             "score": float(score),
-            "raw_line": raw_line.strip(),
+            "timestamp": now,
+            "time": now,  # backward compatibility
+            "ts": now,
+            "time_str": time_iso,
+            "source": source,
+            "metadata": {"line_length": len(raw_line or "")},
+            "raw_line": (raw_line or "").strip(),
         }
+
+        persisted_id = self._persist_event(event)
+        event["id"] = persisted_id if persisted_id is not None else self._next_id()
+
         self.events.appendleft(event)
+        self.last_event_ts = now
 
         self._send_external(event)
 
-    def _send_external(self, event: Dict):
+    def _queue_retry(self, target: str, payload: Dict[str, Any], endpoint: str, attempt: int = 1):
+        if attempt > 5:
+            return
+        delay = min(2 ** attempt, 60)
+        item = {
+            "target": target,
+            "payload": payload,
+            "endpoint": endpoint,
+            "attempt": attempt,
+            "next_retry_at": time.time() + delay,
+        }
+        with self._retry_lock:
+            self._retry_items.append(item)
+
+    def _retry_loop(self):
+        while True:
+            due_items: List[Dict[str, Any]] = []
+            now = time.time()
+            with self._retry_lock:
+                remaining = []
+                for item in self._retry_items:
+                    if item["next_retry_at"] <= now:
+                        due_items.append(item)
+                    else:
+                        remaining.append(item)
+                self._retry_items = remaining
+
+            for item in due_items:
+                ok = self._send_target(item["target"], item["endpoint"], item["payload"])
+                if not ok:
+                    self._queue_retry(
+                        target=item["target"],
+                        payload=item["payload"],
+                        endpoint=item["endpoint"],
+                        attempt=item["attempt"] + 1,
+                    )
+
+            time.sleep(1.0)
+
+    def _send_target(self, target: str, endpoint: str, payload: Dict[str, Any]) -> bool:
+        try:
+            if target == "telegram":
+                requests.post(endpoint, json=payload, timeout=3)
+                return True
+            if target == "webhook":
+                requests.post(endpoint, json=payload, timeout=3)
+                return True
+            return False
+        except Exception:
+            return False
+
+    def _send_external(self, event: Dict[str, Any]):
         if self.telegram_bot_token and self.telegram_chat_id:
-            try:
-                text = (
-                    f"🚨 승강기 이상상황\n"
-                    f"- 채널: {event['channel_name']}\n"
-                    f"- 유형: {event['type']}\n"
-                    f"- 신뢰도: {event['score']:.2f}\n"
-                    f"- 시각: {event['time_str']}"
-                )
-                requests.post(
-                    f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage",
-                    json={"chat_id": self.telegram_chat_id, "text": text},
-                    timeout=3,
-                )
-            except Exception:
-                pass
+            text = (
+                "🚨 승강기 이상상황\n"
+                f"- 채널: {event['channel_name']}\n"
+                f"- 유형: {event['event_type']}\n"
+                f"- 심각도: {event['severity']}\n"
+                f"- 신뢰도: {event['score']:.2f}\n"
+                f"- 시각: {event['time_str']}"
+            )
+            endpoint = f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage"
+            payload = {"chat_id": self.telegram_chat_id, "text": text}
+            ok = self._send_target("telegram", endpoint, payload)
+            if not ok:
+                self._queue_retry("telegram", payload, endpoint, attempt=1)
 
         if self.alert_webhook_url:
-            try:
-                requests.post(self.alert_webhook_url, json=event, timeout=3)
-            except Exception:
-                pass
+            ok = self._send_target("webhook", self.alert_webhook_url, event)
+            if not ok:
+                self._queue_retry("webhook", event, self.alert_webhook_url, attempt=1)
 
-    def recent(self, limit: int = 50, since_id: int = 0) -> List[Dict]:
+    def _filter_memory_events(
+        self,
+        since_id: int,
+        limit: int,
+        channel: Optional[str],
+        event_type: Optional[str],
+        min_score: Optional[float],
+        severity: Optional[str],
+        from_ts: Optional[float],
+        to_ts: Optional[float],
+        query_text: Optional[str],
+        sort: str,
+    ) -> List[Dict[str, Any]]:
+        rows = list(self.events)
+
+        def matched(e: Dict[str, Any]) -> bool:
+            if since_id > 0 and e["id"] <= since_id:
+                return False
+            if channel and e["channel_id"] != channel:
+                return False
+            if event_type and e["event_type"] != event_type:
+                return False
+            if min_score is not None and e["score"] < min_score:
+                return False
+            if severity and e["severity"] != severity:
+                return False
+            ts = e["timestamp"]
+            if from_ts is not None and ts < from_ts:
+                return False
+            if to_ts is not None and ts > to_ts:
+                return False
+            if query_text and query_text not in (e.get("raw_line") or ""):
+                return False
+            return True
+
+        filtered = [e for e in rows if matched(e)]
+        reverse = sort != "asc"
+        filtered.sort(key=lambda e: e["id"], reverse=reverse)
+        return filtered[:limit]
+
+    def query_events(
+        self,
+        since_id: int = 0,
+        limit: int = 50,
+        channel: Optional[str] = None,
+        event_type: Optional[str] = None,
+        min_score: Optional[float] = None,
+        severity: Optional[str] = None,
+        from_ts: Optional[float] = None,
+        to_ts: Optional[float] = None,
+        query_text: Optional[str] = None,
+        sort: str = "desc",
+    ) -> List[Dict[str, Any]]:
+        if not self.db_enabled or not self.db_conn:
+            return self._filter_memory_events(
+                since_id=since_id,
+                limit=limit,
+                channel=channel,
+                event_type=event_type,
+                min_score=min_score,
+                severity=severity,
+                from_ts=from_ts,
+                to_ts=to_ts,
+                query_text=query_text,
+                sort=sort,
+            )
+
+        sql = (
+            "SELECT id, ts, time_str, event_type, severity, channel_id, channel_name, score, source, raw_line, metadata_json "
+            "FROM events WHERE 1=1"
+        )
+        params: List[Any] = []
+
         if since_id > 0:
-            return [e for e in list(self.events) if e["id"] > since_id][:limit]
-        return list(self.events)[:limit]
+            sql += " AND id > ?"
+            params.append(since_id)
+        if channel:
+            sql += " AND channel_id = ?"
+            params.append(channel)
+        if event_type:
+            sql += " AND event_type = ?"
+            params.append(event_type)
+        if min_score is not None:
+            sql += " AND score >= ?"
+            params.append(min_score)
+        if severity:
+            sql += " AND severity = ?"
+            params.append(severity)
+        if from_ts is not None:
+            sql += " AND ts >= ?"
+            params.append(from_ts)
+        if to_ts is not None:
+            sql += " AND ts <= ?"
+            params.append(to_ts)
+        if query_text:
+            sql += " AND raw_line LIKE ?"
+            params.append(f"%{query_text}%")
+
+        direction = "ASC" if sort == "asc" else "DESC"
+        sql += f" ORDER BY id {direction} LIMIT ?"
+        params.append(limit)
+
+        try:
+            with self._db_lock:
+                rows = self.db_conn.execute(sql, tuple(params)).fetchall()
+            return [self._row_to_event(row) for row in rows]
+        except Exception as exc:
+            print(f"[WARN] DB query failed, fallback to memory queue: {exc}")
+            return self._filter_memory_events(
+                since_id=since_id,
+                limit=limit,
+                channel=channel,
+                event_type=event_type,
+                min_score=min_score,
+                severity=severity,
+                from_ts=from_ts,
+                to_ts=to_ts,
+                query_text=query_text,
+                sort=sort,
+            )
+
+    def event_stats(self, from_ts: Optional[float], to_ts: Optional[float]) -> Dict[str, Dict[str, int]]:
+        by_type = defaultdict(int)
+        by_channel = defaultdict(int)
+        by_severity = defaultdict(int)
+
+        if self.db_enabled and self.db_conn:
+            where = "WHERE 1=1"
+            params: List[Any] = []
+            if from_ts is not None:
+                where += " AND ts >= ?"
+                params.append(from_ts)
+            if to_ts is not None:
+                where += " AND ts <= ?"
+                params.append(to_ts)
+            try:
+                with self._db_lock:
+                    for row in self.db_conn.execute(
+                        f"SELECT event_type, COUNT(*) AS cnt FROM events {where} GROUP BY event_type",
+                        tuple(params),
+                    ).fetchall():
+                        by_type[row["event_type"]] = int(row["cnt"])
+                    for row in self.db_conn.execute(
+                        f"SELECT channel_id, COUNT(*) AS cnt FROM events {where} GROUP BY channel_id",
+                        tuple(params),
+                    ).fetchall():
+                        by_channel[row["channel_id"]] = int(row["cnt"])
+                    for row in self.db_conn.execute(
+                        f"SELECT severity, COUNT(*) AS cnt FROM events {where} GROUP BY severity",
+                        tuple(params),
+                    ).fetchall():
+                        by_severity[row["severity"]] = int(row["cnt"])
+            except Exception as exc:
+                print(f"[WARN] Stats aggregation failed: {exc}")
+
+        else:
+            for event in self.events:
+                ts = event["timestamp"]
+                if from_ts is not None and ts < from_ts:
+                    continue
+                if to_ts is not None and ts > to_ts:
+                    continue
+                by_type[event["event_type"]] += 1
+                by_channel[event["channel_id"]] += 1
+                by_severity[event["severity"]] += 1
+
+        return {
+            "by_type": dict(by_type),
+            "by_channel": dict(by_channel),
+            "by_severity": dict(by_severity),
+        }
 
 
 def tail_file(path: str, on_line):
@@ -327,13 +743,58 @@ def create_app(hub: AlertHub):
 
     @app.route("/api/events")
     def api_events():
-        since = int(request.args.get("since", "0") or 0)
-        limit = int(request.args.get("limit", "50") or 50)
-        return jsonify({"events": hub.recent(limit=limit, since_id=since)})
+        since_id = _clamp_int(request.args.get("since_id") or request.args.get("since"), default=0, minimum=0, maximum=10**9)
+        limit = _clamp_int(request.args.get("limit"), default=50, minimum=1, maximum=500)
+
+        channel = (request.args.get("channel") or "").strip() or None
+        event_type = (request.args.get("type") or "").strip() or None
+        severity = (request.args.get("severity") or "").strip() or None
+        min_score = _parse_float(request.args.get("min_score"))
+        from_ts = _parse_float(request.args.get("from_ts"))
+        to_ts = _parse_float(request.args.get("to_ts"))
+        query_text = (request.args.get("q") or "").strip() or None
+        sort = (request.args.get("sort") or "desc").lower().strip()
+        if sort not in ("asc", "desc"):
+            sort = "desc"
+
+        events = hub.query_events(
+            since_id=since_id,
+            limit=limit,
+            channel=channel,
+            event_type=event_type,
+            min_score=min_score,
+            severity=severity,
+            from_ts=from_ts,
+            to_ts=to_ts,
+            query_text=query_text,
+            sort=sort,
+        )
+
+        return jsonify({"events": events, "count": len(events)})
+
+    @app.route("/api/events/stats")
+    def api_event_stats():
+        from_ts = _parse_float(request.args.get("from_ts"))
+        to_ts = _parse_float(request.args.get("to_ts"))
+        stats = hub.event_stats(from_ts=from_ts, to_ts=to_ts)
+        return jsonify({
+            "from_ts": from_ts,
+            "to_ts": to_ts,
+            "stats": stats,
+        })
 
     @app.route("/api/health")
     def health():
-        return jsonify({"status": "ok", "events": len(hub.events), "time": time.time()})
+        return jsonify(
+            {
+                "status": "ok",
+                "time": time.time(),
+                "uptime_sec": int(time.time() - hub.start_ts),
+                "event_queue_size": len(hub.events),
+                "db_enabled": hub.db_enabled,
+                "last_event_ts": hub.last_event_ts,
+            }
+        )
 
     return app
 
