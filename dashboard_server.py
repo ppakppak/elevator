@@ -4,30 +4,41 @@ Elevator 4-channel dashboard + anomaly alert hub
 - 4-way preview grid (ports 5000~5003)
 - DeepStream log tailing (fall/fight events)
 - In-browser live alert feed + optional Telegram/webhook alerts
+- Severity-based alert routing (critical=immediate, warning=digest, info=log-only)
+- App-level health monitoring with auto-recovery
+- Role-based access control (admin/viewer)
 
 API examples:
 - GET /api/events?since=120
 - GET /api/events?channel=rtsp&type=fall&severity=critical&min_score=0.85&limit=30
 - GET /api/events?from_ts=1710000000&to_ts=1710003600&q=신뢰도&sort=asc
 - GET /api/events/stats?from_ts=1710000000&to_ts=1710086400
+- POST /api/channels/<channel_id>/restart  (admin only)
 """
 
 import argparse
 import json
+import logging
+import logging.handlers
 import os
 import re
 import sqlite3
+import subprocess
 import threading
 import time
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from flask import Flask, jsonify, render_template_string, request
 
+# ---------------------------------------------------------------------------
+# Module-level logger (configured in main())
+# ---------------------------------------------------------------------------
+logger = logging.getLogger("elevator-dashboard")
 
 CHANNELS = [
     {
@@ -59,6 +70,17 @@ CHANNELS = [
 FALL_RE = re.compile(r"\[쓰러짐 감지\].*신뢰도:\s*([0-9.]+)")
 FIGHT_RE = re.compile(r"\[싸움 감지\].*신뢰도:\s*([0-9.]+)")
 
+# ---------------------------------------------------------------------------
+# Alert digest interval (seconds). WARNING events are batched.
+# ---------------------------------------------------------------------------
+ALERT_DIGEST_INTERVAL_SEC = int(os.getenv("ALERT_DIGEST_INTERVAL_SEC", "300"))
+
+# ---------------------------------------------------------------------------
+# Health-check settings
+# ---------------------------------------------------------------------------
+HEALTH_CHECK_INTERVAL_SEC = int(os.getenv("HEALTH_CHECK_INTERVAL_SEC", "30"))
+HEALTH_MAX_FAILURES = int(os.getenv("HEALTH_MAX_FAILURES", "3"))
+
 HTML = """
 <!doctype html>
 <html lang="ko">
@@ -71,6 +93,9 @@ HTML = """
     .top { display:flex; justify-content:space-between; align-items:center; padding:10px 14px; background:#111827; border-bottom:1px solid #1f2937; gap:16px; }
     .title { font-weight:700; font-size:18px; }
     .sub { font-size:12px; color:#93c5fd; }
+    .role-badge { padding:3px 10px; border-radius:99px; font-size:11px; font-weight:700; margin-left:10px; }
+    .role-badge.admin { background:#7f1d1d; color:#fecaca; }
+    .role-badge.viewer { background:#1e3a8a; color:#bfdbfe; }
     .layout { display:grid; grid-template-columns:2fr 1fr; gap:10px; padding:10px; }
     .main { display:flex; flex-direction:column; gap:10px; }
     .grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
@@ -111,6 +136,7 @@ HTML = """
     .btn.secondary { background:#334155; }
     .btn.ghost { background:transparent; border:1px solid #334155; }
     .btn.active { background:#047857; }
+    .btn.danger { background:#dc2626; }
     .btn-sm { background:#334155; color:#e2e8f0; border:none; border-radius:6px; padding:3px 8px; font-size:11px; cursor:pointer; }
     .btn-sm.pin-on { background:#7c3aed; color:#ede9fe; }
     .status-line { font-size:12px; color:#cbd5e1; padding:8px 10px; border-top:1px solid #1f2937; display:flex; justify-content:space-between; gap:8px; }
@@ -125,7 +151,10 @@ HTML = """
 <body>
   <div class="top">
     <div>
-      <div class="title">승강기 이상상황 통합 대시보드 (4채널)</div>
+      <div class="title">
+        승강기 이상상황 통합 대시보드 (4채널)
+        <span id="roleBadge" class="role-badge" style="display:none;"></span>
+      </div>
       <div class="sub">실시간 모니터링 + 이벤트 알람 + 운영 필터</div>
     </div>
     <div id="clock" class="sub"></div>
@@ -231,7 +260,8 @@ HTML = """
         <div class="hint">
           - Webcam은 장치 점유 특성상 추론/미리보기 동시 사용이 제한될 수 있음<br/>
           - Telegram/Webhook 알람은 서버 환경변수 설정 시 자동 전송<br/>
-          - 카드별 버튼: 확대/고정, 순환표시와 연동
+          - 카드별 버튼: 확대/고정, 순환표시와 연동<br/>
+          - 알림 정책: critical=즉시, warning=5분 다이제스트, info=로그만
         </div>
       </div>
     </div>
@@ -240,6 +270,7 @@ HTML = """
 <script>
 const channels = {{ channels|tojson }};
 const pageToken = new URLSearchParams(location.search).get('token') || '';
+const userRole = '{{ user_role }}';
 const state = {
   lastEventId: 0,
   lastRenderedTopId: 0,
@@ -277,6 +308,19 @@ function withToken(params){
   return params;
 }
 
+function showRoleBadge(){
+  const badge = document.getElementById('roleBadge');
+  if(userRole === 'admin'){
+    badge.textContent = 'Admin';
+    badge.className = 'role-badge admin';
+    badge.style.display = 'inline';
+  } else if(userRole === 'viewer'){
+    badge.textContent = 'Viewer';
+    badge.className = 'role-badge viewer';
+    badge.style.display = 'inline';
+  }
+}
+
 function initChannelFilterOptions(){
   const sel = document.getElementById('fChannel');
   channels.forEach(ch => {
@@ -291,6 +335,9 @@ function makeGrid(){
   const grid = document.getElementById('grid');
   grid.innerHTML = '';
   channels.forEach(ch => {
+    const restartBtn = userRole === 'admin'
+      ? `<button class="btn-sm" data-action="restart" data-channel="${ch.id}" style="background:#dc2626;">재시작</button>`
+      : '';
     const card = document.createElement('div');
     card.className = 'card';
     card.id = `card_${ch.id}`;
@@ -304,6 +351,7 @@ function makeGrid(){
         <div class="head-tools">
           <button class="btn-sm" data-action="focus" data-channel="${ch.id}">확대</button>
           <button class="btn-sm" id="pin_${ch.id}" data-action="pin" data-channel="${ch.id}">고정</button>
+          ${restartBtn}
         </div>
       </div>
       <img id="img_${ch.id}" src="${streamUrl(ch.port)}" alt="${ch.name}"/>
@@ -325,7 +373,22 @@ function makeGrid(){
       }
     }
     if(action === 'pin') togglePin(channelId);
+    if(action === 'restart') restartChannel(channelId);
   });
+}
+
+async function restartChannel(channelId){
+  if(!confirm(`${channelId} 채널 미리보기를 재시작하시겠습니까?`)) return;
+  try {
+    const params = new URLSearchParams();
+    if(pageToken) params.set('token', pageToken);
+    const r = await fetch(`/api/channels/${channelId}/restart?${params.toString()}`, {method:'POST'});
+    const j = await r.json();
+    if(r.ok) alert(`${channelId} 재시작 요청 완료: ${j.message || 'ok'}`);
+    else alert(`재시작 실패: ${j.error || j.message || r.status}`);
+  } catch(e) {
+    alert(`재시작 요청 실패: ${e.message}`);
+  }
 }
 
 function setFocusedChannel(channelId){
@@ -637,6 +700,7 @@ function tickClock(){
   document.getElementById('clock').textContent = new Date().toLocaleString();
 }
 
+showRoleBadge();
 initChannelFilterOptions();
 makeGrid();
 bindControlEvents();
@@ -655,6 +719,10 @@ tickClock();
 </html>
 """
 
+
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
 
 def _clamp_int(value: Optional[str], default: int, minimum: int, maximum: int) -> int:
     try:
@@ -691,6 +759,116 @@ def infer_severity(event_type: str, score: float) -> str:
     return "normal"
 
 
+# ---------------------------------------------------------------------------
+# Channel Health Monitor (Feature 2)
+# ---------------------------------------------------------------------------
+
+class ChannelHealthMonitor:
+    """Monitor preview channels and auto-recover on repeated failures."""
+
+    def __init__(self, hub: "AlertHub"):
+        self.hub = hub
+        self._channel_state: Dict[str, Dict[str, Any]] = {}
+        for ch in CHANNELS:
+            self._channel_state[ch["id"]] = {
+                "online": False,
+                "consecutive_failures": 0,
+                "last_check_ts": None,
+                "last_recovery_ts": None,
+                "last_ok_ts": None,
+            }
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def _loop(self):
+        while True:
+            for ch in CHANNELS:
+                self._check_channel(ch)
+            time.sleep(HEALTH_CHECK_INTERVAL_SEC)
+
+    def _check_channel(self, ch: Dict[str, Any]):
+        channel_id = ch["id"]
+        port = ch["port"]
+        now = time.time()
+
+        ok = False
+        try:
+            resp = requests.get(f"http://127.0.0.1:{port}/stats", timeout=5)
+            ok = resp.status_code == 200
+        except Exception:
+            ok = False
+
+        with self._lock:
+            state = self._channel_state[channel_id]
+            state["last_check_ts"] = now
+
+            if ok:
+                state["online"] = True
+                state["consecutive_failures"] = 0
+                state["last_ok_ts"] = now
+            else:
+                state["online"] = False
+                state["consecutive_failures"] += 1
+                failures = state["consecutive_failures"]
+
+                logger.warning(
+                    "Channel %s health check failed (%d/%d)",
+                    channel_id, failures, HEALTH_MAX_FAILURES,
+                )
+
+                if failures >= HEALTH_MAX_FAILURES:
+                    self._attempt_recovery(channel_id, state)
+
+    def _attempt_recovery(self, channel_id: str, state: Dict[str, Any]):
+        service_name = f"elevator-preview-{channel_id}.service"
+        logger.error(
+            "Channel %s failed %d consecutive checks — attempting auto-recovery: systemctl --user restart %s",
+            channel_id, state["consecutive_failures"], service_name,
+        )
+
+        try:
+            result = subprocess.run(
+                ["systemctl", "--user", "restart", service_name],
+                capture_output=True, text=True, timeout=15,
+            )
+            state["last_recovery_ts"] = time.time()
+            state["consecutive_failures"] = 0  # reset after attempt
+
+            if result.returncode == 0:
+                logger.info("Auto-recovery of %s succeeded", service_name)
+                recovery_msg = f"자동 복구 시도 성공: {service_name}"
+            else:
+                logger.error(
+                    "Auto-recovery of %s failed (rc=%d): %s",
+                    service_name, result.returncode, result.stderr.strip(),
+                )
+                recovery_msg = f"자동 복구 실패: {service_name} (rc={result.returncode})"
+        except Exception as exc:
+            state["last_recovery_ts"] = time.time()
+            state["consecutive_failures"] = 0
+            logger.error("Auto-recovery of %s raised exception: %s", service_name, exc)
+            recovery_msg = f"자동 복구 예외: {service_name}: {exc}"
+
+        # Push a CRITICAL alert about the recovery
+        self.hub.push_system_alert(
+            channel_id=channel_id,
+            event_type="channel_recovery",
+            severity="critical",
+            message=recovery_msg,
+        )
+
+    def get_status(self) -> Dict[str, Dict[str, Any]]:
+        with self._lock:
+            return {k: dict(v) for k, v in self._channel_state.items()}
+
+
+# ---------------------------------------------------------------------------
+# AlertHub
+# ---------------------------------------------------------------------------
+
 class AlertHub:
     """Collect, persist, query, and relay anomaly events."""
 
@@ -723,6 +901,20 @@ class AlertHub:
         self._retry_thread = threading.Thread(target=self._retry_loop, daemon=True)
         self._retry_thread.start()
 
+        # --- Feature 1: warning digest queue ---
+        self._warning_queue: List[Dict[str, Any]] = []
+        self._warning_lock = threading.Lock()
+        self._digest_thread = threading.Thread(target=self._digest_loop, daemon=True)
+        self._digest_thread.start()
+
+        # --- Feature 2: channel health monitor ---
+        self.health_monitor = ChannelHealthMonitor(hub=self)
+        self.health_monitor.start()
+
+    # ------------------------------------------------------------------
+    # SQLite
+    # ------------------------------------------------------------------
+
     def _init_db(self) -> bool:
         try:
             conn = sqlite3.connect(self.db_path, check_same_thread=False)
@@ -750,9 +942,10 @@ class AlertHub:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_events_severity ON events(severity)")
             conn.commit()
             self.db_conn = conn
+            logger.info("SQLite database initialized: %s", self.db_path)
             return True
         except Exception as exc:
-            print(f"[WARN] SQLite init failed: {exc}")
+            logger.warning("SQLite init failed: %s", exc)
             self.db_conn = None
             return False
 
@@ -778,8 +971,10 @@ class AlertHub:
 
             if self.events:
                 self.last_event_ts = max(event["timestamp"] for event in self.events)
+
+            logger.info("Loaded %d recent events from DB (seq=%d)", len(rows), self._seq)
         except Exception as exc:
-            print(f"[WARN] Failed to bootstrap in-memory queue from DB: {exc}")
+            logger.warning("Failed to bootstrap in-memory queue from DB: %s", exc)
 
     def _row_to_event(self, row: sqlite3.Row) -> Dict[str, Any]:
         metadata = {}
@@ -793,14 +988,14 @@ class AlertHub:
         return {
             "id": int(row["id"]),
             "event_type": row["event_type"],
-            "type": row["event_type"],  # backward compatibility
+            "type": row["event_type"],
             "severity": row["severity"],
             "channel_id": row["channel_id"],
-            "channel": row["channel_id"],  # backward compatibility
+            "channel": row["channel_id"],
             "channel_name": row["channel_name"],
             "score": float(row["score"]),
             "timestamp": float(row["ts"]),
-            "time": float(row["ts"]),  # backward compatibility
+            "time": float(row["ts"]),
             "ts": float(row["ts"]),
             "time_str": row["time_str"],
             "source": row["source"],
@@ -848,8 +1043,12 @@ class AlertHub:
                 self.db_conn.commit()
                 return int(cursor.lastrowid)
         except Exception as exc:
-            print(f"[WARN] Event persistence failed: {exc}")
+            logger.warning("Event persistence failed: %s", exc)
             return None
+
+    # ------------------------------------------------------------------
+    # Event ingestion
+    # ------------------------------------------------------------------
 
     def push(self, channel_id: str, event_type: str, score: float, raw_line: str, source: str = "deepstream-log"):
         now = time.time()
@@ -861,16 +1060,16 @@ class AlertHub:
         time_iso = datetime.fromtimestamp(now, tz=timezone.utc).astimezone().isoformat(timespec="seconds")
 
         event = {
-            "id": 0,  # assigned below
+            "id": 0,
             "event_type": event_type,
-            "type": event_type,  # backward compatibility
+            "type": event_type,
             "severity": severity,
             "channel_id": channel_id,
-            "channel": channel_id,  # backward compatibility
+            "channel": channel_id,
             "channel_name": channel.get("name", channel_id),
             "score": float(score),
             "timestamp": now,
-            "time": now,  # backward compatibility
+            "time": now,
             "ts": now,
             "time_str": time_iso,
             "source": source,
@@ -884,10 +1083,139 @@ class AlertHub:
         self.events.appendleft(event)
         self.last_event_ts = now
 
-        self._send_external(event)
+        logger.info(
+            "Event: type=%s severity=%s channel=%s score=%.2f",
+            event_type, severity, channel_id, score,
+        )
+
+        self._route_alert(event)
+
+    def push_system_alert(self, channel_id: str, event_type: str, severity: str, message: str):
+        """Push a system-generated alert (e.g. auto-recovery)."""
+        now = time.time()
+        time_iso = datetime.fromtimestamp(now, tz=timezone.utc).astimezone().isoformat(timespec="seconds")
+        channel = self.channel_map.get(channel_id, {"name": channel_id})
+
+        event = {
+            "id": 0,
+            "event_type": event_type,
+            "type": event_type,
+            "severity": severity,
+            "channel_id": channel_id,
+            "channel": channel_id,
+            "channel_name": channel.get("name", channel_id),
+            "score": 0.0,
+            "timestamp": now,
+            "time": now,
+            "ts": now,
+            "time_str": time_iso,
+            "source": "health-monitor",
+            "metadata": {"message": message},
+            "raw_line": message,
+        }
+
+        persisted_id = self._persist_event(event)
+        event["id"] = persisted_id if persisted_id is not None else self._next_id()
+
+        self.events.appendleft(event)
+        self.last_event_ts = now
+
+        logger.warning("System alert: %s — %s", event_type, message)
+        self._route_alert(event)
+
+    # ------------------------------------------------------------------
+    # Feature 1: severity-based alert routing
+    # ------------------------------------------------------------------
+
+    def _route_alert(self, event: Dict[str, Any]):
+        """Route alert based on severity: critical→immediate, warning→digest, info/normal→log only."""
+        severity = event.get("severity", "normal").lower()
+
+        if severity == "critical":
+            self._send_external_immediate(event)
+        elif severity == "warning":
+            with self._warning_lock:
+                self._warning_queue.append(event)
+            logger.debug("Warning event queued for digest (queue size: %d)", len(self._warning_queue))
+        else:
+            # info/normal — log only, no external alert
+            logger.debug("Info/normal event — no external alert")
+
+    def _send_external_immediate(self, event: Dict[str, Any]):
+        """Send CRITICAL alert immediately via Telegram AND webhook."""
+        if self.telegram_bot_token and self.telegram_chat_id:
+            text = (
+                "🚨 [CRITICAL] 승강기 이상상황\n"
+                f"- 채널: {event['channel_name']}\n"
+                f"- 유형: {event['event_type']}\n"
+                f"- 심각도: {event['severity']}\n"
+                f"- 신뢰도: {event['score']:.2f}\n"
+                f"- 시각: {event['time_str']}"
+            )
+            endpoint = f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage"
+            payload = {"chat_id": self.telegram_chat_id, "text": text}
+            ok = self._send_target("telegram", endpoint, payload)
+            if not ok:
+                self._queue_retry("telegram", payload, endpoint, attempt=1)
+
+        if self.alert_webhook_url:
+            ok = self._send_target("webhook", self.alert_webhook_url, event)
+            if not ok:
+                self._queue_retry("webhook", event, self.alert_webhook_url, attempt=1)
+
+    def _digest_loop(self):
+        """Background thread: flush warning digest every ALERT_DIGEST_INTERVAL_SEC."""
+        while True:
+            time.sleep(ALERT_DIGEST_INTERVAL_SEC)
+            self._flush_warning_digest()
+
+    def _flush_warning_digest(self):
+        """Collect queued warnings and send as a single digest message."""
+        with self._warning_lock:
+            if not self._warning_queue:
+                return
+            batch = list(self._warning_queue)
+            self._warning_queue.clear()
+
+        count = len(batch)
+        logger.info("Flushing warning digest: %d events", count)
+
+        lines = [f"⚠️ 승강기 경고 다이제스트 ({count}건)\n"]
+        for ev in batch[:20]:  # cap at 20 to avoid huge messages
+            lines.append(
+                f"  • [{ev.get('event_type', '?')}] {ev.get('channel_name', '?')} "
+                f"score={ev.get('score', 0):.2f} @ {ev.get('time_str', '-')}"
+            )
+        if count > 20:
+            lines.append(f"  ... 외 {count - 20}건")
+
+        digest_text = "\n".join(lines)
+
+        if self.telegram_bot_token and self.telegram_chat_id:
+            endpoint = f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage"
+            payload = {"chat_id": self.telegram_chat_id, "text": digest_text}
+            ok = self._send_target("telegram", endpoint, payload)
+            if not ok:
+                self._queue_retry("telegram", payload, endpoint, attempt=1)
+
+        if self.alert_webhook_url:
+            digest_payload = {
+                "type": "warning_digest",
+                "count": count,
+                "events": batch[:50],
+                "text": digest_text,
+            }
+            ok = self._send_target("webhook", self.alert_webhook_url, digest_payload)
+            if not ok:
+                self._queue_retry("webhook", digest_payload, self.alert_webhook_url, attempt=1)
+
+    # ------------------------------------------------------------------
+    # Retry queue (unchanged logic, logging updated)
+    # ------------------------------------------------------------------
 
     def _queue_retry(self, target: str, payload: Dict[str, Any], endpoint: str, attempt: int = 1):
         if attempt > 5:
+            logger.error("Alert retry exhausted (5 attempts) for target=%s endpoint=%s", target, endpoint)
             return
         delay = min(2 ** attempt, 60)
         item = {
@@ -899,6 +1227,7 @@ class AlertHub:
         }
         with self._retry_lock:
             self._retry_items.append(item)
+        logger.debug("Queued retry #%d for %s (delay=%.0fs)", attempt, target, delay)
 
     def _retry_loop(self):
         while True:
@@ -934,29 +1263,13 @@ class AlertHub:
                 requests.post(endpoint, json=payload, timeout=3)
                 return True
             return False
-        except Exception:
+        except Exception as exc:
+            logger.debug("External alert send failed (%s): %s", target, exc)
             return False
 
-    def _send_external(self, event: Dict[str, Any]):
-        if self.telegram_bot_token and self.telegram_chat_id:
-            text = (
-                "🚨 승강기 이상상황\n"
-                f"- 채널: {event['channel_name']}\n"
-                f"- 유형: {event['event_type']}\n"
-                f"- 심각도: {event['severity']}\n"
-                f"- 신뢰도: {event['score']:.2f}\n"
-                f"- 시각: {event['time_str']}"
-            )
-            endpoint = f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage"
-            payload = {"chat_id": self.telegram_chat_id, "text": text}
-            ok = self._send_target("telegram", endpoint, payload)
-            if not ok:
-                self._queue_retry("telegram", payload, endpoint, attempt=1)
-
-        if self.alert_webhook_url:
-            ok = self._send_target("webhook", self.alert_webhook_url, event)
-            if not ok:
-                self._queue_retry("webhook", event, self.alert_webhook_url, attempt=1)
+    # ------------------------------------------------------------------
+    # Query / stats (unchanged logic, logging updated)
+    # ------------------------------------------------------------------
 
     def _filter_memory_events(
         self,
@@ -1013,16 +1326,9 @@ class AlertHub:
     ) -> List[Dict[str, Any]]:
         if not self.db_enabled or not self.db_conn:
             return self._filter_memory_events(
-                since_id=since_id,
-                limit=limit,
-                channel=channel,
-                event_type=event_type,
-                min_score=min_score,
-                severity=severity,
-                from_ts=from_ts,
-                to_ts=to_ts,
-                query_text=query_text,
-                sort=sort,
+                since_id=since_id, limit=limit, channel=channel, event_type=event_type,
+                min_score=min_score, severity=severity, from_ts=from_ts, to_ts=to_ts,
+                query_text=query_text, sort=sort,
             )
 
         sql = (
@@ -1065,18 +1371,11 @@ class AlertHub:
                 rows = self.db_conn.execute(sql, tuple(params)).fetchall()
             return [self._row_to_event(row) for row in rows]
         except Exception as exc:
-            print(f"[WARN] DB query failed, fallback to memory queue: {exc}")
+            logger.warning("DB query failed, fallback to memory queue: %s", exc)
             return self._filter_memory_events(
-                since_id=since_id,
-                limit=limit,
-                channel=channel,
-                event_type=event_type,
-                min_score=min_score,
-                severity=severity,
-                from_ts=from_ts,
-                to_ts=to_ts,
-                query_text=query_text,
-                sort=sort,
+                since_id=since_id, limit=limit, channel=channel, event_type=event_type,
+                min_score=min_score, severity=severity, from_ts=from_ts, to_ts=to_ts,
+                query_text=query_text, sort=sort,
             )
 
     def event_stats(self, from_ts: Optional[float], to_ts: Optional[float]) -> Dict[str, Dict[str, int]]:
@@ -1111,8 +1410,7 @@ class AlertHub:
                     ).fetchall():
                         by_severity[row["severity"]] = int(row["cnt"])
             except Exception as exc:
-                print(f"[WARN] Stats aggregation failed: {exc}")
-
+                logger.warning("Stats aggregation failed: %s", exc)
         else:
             for event in self.events:
                 ts = event["timestamp"]
@@ -1134,6 +1432,14 @@ class AlertHub:
         with self._retry_lock:
             return len(self._retry_items)
 
+    def warning_queue_size(self) -> int:
+        with self._warning_lock:
+            return len(self._warning_queue)
+
+
+# ---------------------------------------------------------------------------
+# Log tail
+# ---------------------------------------------------------------------------
 
 def tail_file(path: str, on_line):
     p = Path(path)
@@ -1153,7 +1459,6 @@ def tail_file(path: str, on_line):
                         on_line(line)
                         continue
 
-                    # rotated/truncated check
                     try:
                         if p.exists() and p.stat().st_ino != inode:
                             break
@@ -1161,7 +1466,8 @@ def tail_file(path: str, on_line):
                         break
 
                     time.sleep(0.2)
-        except Exception:
+        except Exception as exc:
+            logger.debug("tail_file error on %s: %s", path, exc)
             time.sleep(1.0)
 
 
@@ -1177,32 +1483,79 @@ def parse_line(channel_id: str, line: str, hub: AlertHub):
         return
 
 
+# ---------------------------------------------------------------------------
+# Feature 4: Role-based access control
+# ---------------------------------------------------------------------------
+
+def _resolve_role(token: str, admin_token: str, viewer_token: str, legacy_token: str) -> Tuple[bool, str]:
+    """
+    Determine role from provided token.
+    Returns (authorized: bool, role: str).
+    If no tokens are configured, everyone is admin (open access).
+    """
+    token_enabled = bool(admin_token or viewer_token or legacy_token)
+
+    if not token_enabled:
+        return True, "admin"
+
+    if not token:
+        return False, ""
+
+    if admin_token and token == admin_token:
+        return True, "admin"
+    if legacy_token and token == legacy_token:
+        return True, "admin"  # backward compat
+    if viewer_token and token == viewer_token:
+        return True, "viewer"
+
+    return False, ""
+
+
 def create_app(hub: AlertHub):
     app = Flask(__name__)
-    access_token = os.getenv("DASHBOARD_ACCESS_TOKEN", "").strip()
-    token_enabled = bool(access_token)
 
-    def token_required(view_func):
+    # --- Feature 4: role-based tokens ---
+    admin_token = os.getenv("DASHBOARD_ADMIN_TOKEN", "").strip()
+    viewer_token = os.getenv("DASHBOARD_VIEWER_TOKEN", "").strip()
+    legacy_token = os.getenv("DASHBOARD_ACCESS_TOKEN", "").strip()  # backward compat → admin
+    token_enabled = bool(admin_token or viewer_token or legacy_token)
+
+    def _get_role() -> Tuple[bool, str]:
+        provided = _extract_request_token()
+        return _resolve_role(provided, admin_token, viewer_token, legacy_token)
+
+    def any_role_required(view_func):
+        """Allow any authenticated user (admin or viewer)."""
         @wraps(view_func)
         def _wrapped(*args, **kwargs):
-            if not token_enabled:
-                return view_func(*args, **kwargs)
-
-            provided = _extract_request_token()
-            if provided != access_token:
+            authorized, role = _get_role()
+            if not authorized:
                 return jsonify({"error": "unauthorized", "message": "valid token required"}), 401
-            return view_func(*args, **kwargs)
+            return view_func(*args, role=role, **kwargs)
+        return _wrapped
 
+    def admin_required(view_func):
+        """Allow only admin users."""
+        @wraps(view_func)
+        def _wrapped(*args, **kwargs):
+            authorized, role = _get_role()
+            if not authorized:
+                return jsonify({"error": "unauthorized", "message": "valid token required"}), 401
+            if role != "admin":
+                return jsonify({"error": "forbidden", "message": "admin access required"}), 403
+            return view_func(*args, role=role, **kwargs)
         return _wrapped
 
     @app.route("/")
-    @token_required
     def index():
-        return render_template_string(HTML, channels=CHANNELS)
+        authorized, role = _get_role()
+        if not authorized:
+            return jsonify({"error": "unauthorized", "message": "valid token required"}), 401
+        return render_template_string(HTML, channels=CHANNELS, user_role=role)
 
     @app.route("/api/events")
-    @token_required
-    def api_events():
+    @any_role_required
+    def api_events(role="viewer"):
         since_id = _clamp_int(request.args.get("since_id") or request.args.get("since"), default=0, minimum=0, maximum=10**9)
         limit = _clamp_int(request.args.get("limit"), default=50, minimum=1, maximum=500)
 
@@ -1218,57 +1571,138 @@ def create_app(hub: AlertHub):
             sort = "desc"
 
         events = hub.query_events(
-            since_id=since_id,
-            limit=limit,
-            channel=channel,
-            event_type=event_type,
-            min_score=min_score,
-            severity=severity,
-            from_ts=from_ts,
-            to_ts=to_ts,
-            query_text=query_text,
-            sort=sort,
+            since_id=since_id, limit=limit, channel=channel, event_type=event_type,
+            min_score=min_score, severity=severity, from_ts=from_ts, to_ts=to_ts,
+            query_text=query_text, sort=sort,
         )
 
         return jsonify({"events": events, "count": len(events)})
 
     @app.route("/api/events/stats")
-    @token_required
-    def api_event_stats():
+    @any_role_required
+    def api_event_stats(role="viewer"):
         from_ts = _parse_float(request.args.get("from_ts"))
         to_ts = _parse_float(request.args.get("to_ts"))
         stats = hub.event_stats(from_ts=from_ts, to_ts=to_ts)
-        return jsonify({
-            "from_ts": from_ts,
-            "to_ts": to_ts,
-            "stats": stats,
-        })
+        return jsonify({"from_ts": from_ts, "to_ts": to_ts, "stats": stats})
 
     @app.route("/api/health")
-    @token_required
-    def health():
-        return jsonify(
-            {
-                "status": "ok",
-                "time": time.time(),
-                "uptime_sec": int(time.time() - hub.start_ts),
-                "event_queue_size": len(hub.events),
-                "db_enabled": hub.db_enabled,
-                "last_event_ts": hub.last_event_ts,
-                "retry_queue_size": hub.retry_queue_size(),
-                "token_enabled": token_enabled,
-            }
-        )
+    @any_role_required
+    def health(role="viewer"):
+        channel_health = hub.health_monitor.get_status()
+        return jsonify({
+            "status": "ok",
+            "time": time.time(),
+            "uptime_sec": int(time.time() - hub.start_ts),
+            "event_queue_size": len(hub.events),
+            "db_enabled": hub.db_enabled,
+            "last_event_ts": hub.last_event_ts,
+            "retry_queue_size": hub.retry_queue_size(),
+            "warning_queue_size": hub.warning_queue_size(),
+            "token_enabled": token_enabled,
+            "channels": channel_health,
+        })
+
+    @app.route("/api/channels/<channel_id>/restart", methods=["POST"])
+    @admin_required
+    def restart_channel(channel_id, role="admin"):
+        """Admin-only: restart a preview channel service."""
+        valid_ids = {ch["id"] for ch in CHANNELS}
+        if channel_id not in valid_ids:
+            return jsonify({"error": "not_found", "message": f"Unknown channel: {channel_id}"}), 404
+
+        service_name = f"elevator-preview-{channel_id}.service"
+        logger.info("Admin requested restart of %s", service_name)
+
+        try:
+            result = subprocess.run(
+                ["systemctl", "--user", "restart", service_name],
+                capture_output=True, text=True, timeout=15,
+            )
+            if result.returncode == 0:
+                logger.info("Manual restart of %s succeeded", service_name)
+                return jsonify({"status": "ok", "message": f"{service_name} restarted successfully"})
+            else:
+                logger.error("Manual restart of %s failed (rc=%d): %s", service_name, result.returncode, result.stderr.strip())
+                return jsonify({
+                    "error": "restart_failed",
+                    "message": f"systemctl returned {result.returncode}",
+                    "stderr": result.stderr.strip(),
+                }), 500
+        except Exception as exc:
+            logger.error("Manual restart of %s raised exception: %s", service_name, exc)
+            return jsonify({"error": "exception", "message": str(exc)}), 500
 
     return app
 
+
+# ---------------------------------------------------------------------------
+# Feature 3: Logging setup
+# ---------------------------------------------------------------------------
+
+def setup_logging(log_level: str = "INFO", log_file: Optional[str] = None):
+    """Configure structured logging with rotation."""
+    level = getattr(logging, log_level.upper(), logging.INFO)
+
+    fmt = "%(asctime)s [%(levelname)s] %(name)s - %(message)s"
+    formatter = logging.Formatter(fmt)
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(level)
+
+    # Console handler (always)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(level)
+    console_handler.setFormatter(formatter)
+    root_logger.addHandler(console_handler)
+
+    # File handler with rotation (if configured)
+    if log_file is None:
+        log_file = os.getenv("LOG_FILE", "").strip()
+
+    if not log_file:
+        log_file = "logs/dashboard.log"
+
+    try:
+        log_path = Path(log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.handlers.RotatingFileHandler(
+            log_file,
+            maxBytes=10 * 1024 * 1024,  # 10 MB
+            backupCount=5,
+            encoding="utf-8",
+        )
+        file_handler.setLevel(level)
+        file_handler.setFormatter(formatter)
+        root_logger.addHandler(file_handler)
+        logger.info("Log file: %s (rotation: 10MB x 5)", log_file)
+    except Exception as exc:
+        logger.warning("Failed to set up file logging at %s: %s", log_file, exc)
+
+    # Quieten noisy libraries
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("werkzeug").setLevel(logging.WARNING)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="Elevator 4-channel dashboard + alert hub")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=7000)
     parser.add_argument("--cooldown", type=int, default=30, help="alert cooldown per channel/event")
+    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+                        help="logging level (default: INFO)")
     args = parser.parse_args()
+
+    # Feature 3: structured logging
+    setup_logging(log_level=args.log_level)
+
+    logger.info("Starting Elevator Dashboard on %s:%d (cooldown=%ds)", args.host, args.port, args.cooldown)
+    logger.info("Alert digest interval: %ds, Health check interval: %ds, Max failures: %d",
+                ALERT_DIGEST_INTERVAL_SEC, HEALTH_CHECK_INTERVAL_SEC, HEALTH_MAX_FAILURES)
 
     hub = AlertHub(cooldown_sec=args.cooldown)
 
@@ -1280,6 +1714,7 @@ def main():
             daemon=True,
         )
         t.start()
+        logger.info("Log tailer started for channel %s: %s", ch["id"], ch["ds_log"])
 
     app = create_app(hub)
     app.run(host=args.host, port=args.port, debug=False, threaded=True)
