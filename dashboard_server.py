@@ -88,84 +88,430 @@ HTML = """
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Elevator Safety Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
   <style>
-    body { margin:0; font-family:Arial,sans-serif; background:#0f172a; color:#e2e8f0; }
-    .top { display:flex; justify-content:space-between; align-items:center; padding:10px 14px; background:#111827; border-bottom:1px solid #1f2937; gap:16px; }
-    .title { font-weight:700; font-size:18px; }
-    .sub { font-size:12px; color:#93c5fd; }
-    .role-badge { padding:3px 10px; border-radius:99px; font-size:11px; font-weight:700; margin-left:10px; }
-    .role-badge.admin { background:#7f1d1d; color:#fecaca; }
-    .role-badge.viewer { background:#1e3a8a; color:#bfdbfe; }
-    .layout { display:grid; grid-template-columns:2fr 1fr; gap:10px; padding:10px; }
-    .main { display:flex; flex-direction:column; gap:10px; }
-    .grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
-    .grid.focus-mode .card { display:none; }
-    .grid.focus-mode .card.focused { display:block; grid-column:1 / -1; }
-    .grid.focus-mode .card.focused img { height:640px; }
-    .card { background:#111827; border:1px solid #1f2937; border-radius:10px; overflow:hidden; }
-    .head { display:flex; justify-content:space-between; align-items:center; padding:8px 10px; font-size:13px; background:#0b1220; gap:8px; }
-    .head-title { display:flex; align-items:center; gap:8px; }
-    .head-tools { display:flex; gap:6px; }
-    .ok { color:#34d399; }
-    .bad { color:#f87171; }
-    .warn { color:#fbbf24; }
-    img { width:100%; height:280px; object-fit:contain; background:#000; display:block; }
-    .stats { font-size:12px; color:#cbd5e1; padding:6px 10px; border-top:1px solid #1f2937; }
-    .side { display:flex; flex-direction:column; gap:10px; }
-    .events { max-height:560px; overflow:auto; padding:8px; }
-    .ev { border:1px solid #334155; border-radius:8px; padding:8px; margin-bottom:8px; background:#0b1220; }
-    .ev.fall { border-color:#f43f5e; }
-    .ev.fight { border-color:#f59e0b; }
-    .ev .meta { font-size:12px; color:#cbd5e1; }
-    .ev .line { font-size:14px; font-weight:600; display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
-    .pill { padding:2px 8px; border-radius:99px; font-size:11px; font-weight:700; }
-    .pill.fall { background:#7f1d1d; color:#fecaca; }
-    .pill.fight { background:#78350f; color:#fde68a; }
-    .pill.critical { background:#7f1d1d; color:#fecaca; }
-    .pill.warning { background:#78350f; color:#fde68a; }
-    .pill.normal { background:#1e3a8a; color:#bfdbfe; }
-    .hint { font-size:12px; color:#94a3b8; padding:8px 10px; border-top:1px solid #1f2937; }
-    .controls { padding:10px; display:flex; flex-direction:column; gap:8px; }
-    .row { display:grid; grid-template-columns:repeat(3, 1fr); gap:8px; }
-    .row-4 { display:grid; grid-template-columns:repeat(4, 1fr); gap:8px; }
-    .field { display:flex; flex-direction:column; gap:4px; }
-    .field label { font-size:11px; color:#93c5fd; }
-    .field input, .field select { background:#0b1220; color:#e2e8f0; border:1px solid #334155; border-radius:6px; padding:6px 8px; font-size:12px; }
-    .actions { display:flex; gap:8px; flex-wrap:wrap; }
-    .btn { background:#1d4ed8; color:white; border:none; border-radius:6px; padding:6px 10px; font-size:12px; cursor:pointer; }
-    .btn.secondary { background:#334155; }
-    .btn.ghost { background:transparent; border:1px solid #334155; }
-    .btn.active { background:#047857; }
-    .btn.danger { background:#dc2626; }
-    .btn-sm { background:#334155; color:#e2e8f0; border:none; border-radius:6px; padding:3px 8px; font-size:11px; cursor:pointer; }
-    .btn-sm.pin-on { background:#7c3aed; color:#ede9fe; }
-    .status-line { font-size:12px; color:#cbd5e1; padding:8px 10px; border-top:1px solid #1f2937; display:flex; justify-content:space-between; gap:8px; }
-    .stats-grid { padding:10px; font-size:12px; color:#cbd5e1; }
-    .stats-grid ul { margin:4px 0 8px 14px; padding:0; }
-    @media (max-width: 1300px) {
-      .layout { grid-template-columns:1fr; }
-      .row, .row-4 { grid-template-columns:repeat(2, 1fr); }
+    *, *::before, *::after { box-sizing:border-box; margin:0; padding:0; }
+    :root {
+      --bg-primary: #0a0e1a;
+      --bg-secondary: #111827;
+      --bg-card: rgba(17,24,39,0.7);
+      --bg-card-hover: rgba(17,24,39,0.9);
+      --bg-input: rgba(15,23,42,0.8);
+      --border: rgba(99,102,241,0.15);
+      --border-hover: rgba(99,102,241,0.3);
+      --accent: #6366f1;
+      --accent-glow: rgba(99,102,241,0.15);
+      --text-primary: #f1f5f9;
+      --text-secondary: #94a3b8;
+      --text-muted: #64748b;
+      --green: #10b981;
+      --red: #ef4444;
+      --amber: #f59e0b;
+      --blue: #3b82f6;
+      --radius: 12px;
+      --radius-sm: 8px;
+      --shadow: 0 4px 24px rgba(0,0,0,0.3);
+      --shadow-lg: 0 8px 40px rgba(0,0,0,0.4);
+      --glass: saturate(180%) blur(16px);
+    }
+
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+
+    /* Animated background */
+    body::before {
+      content: '';
+      position: fixed;
+      top: -50%;
+      left: -50%;
+      width: 200%;
+      height: 200%;
+      background: radial-gradient(circle at 20% 50%, rgba(99,102,241,0.04) 0%, transparent 50%),
+                  radial-gradient(circle at 80% 20%, rgba(16,185,129,0.03) 0%, transparent 50%),
+                  radial-gradient(circle at 50% 80%, rgba(239,68,68,0.02) 0%, transparent 50%);
+      z-index: -1;
+      animation: bgShift 30s ease-in-out infinite alternate;
+    }
+    @keyframes bgShift { to { transform: translate(5%, 3%) rotate(2deg); } }
+
+    /* ─── Header ─── */
+    .top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 16px 24px;
+      background: linear-gradient(135deg, rgba(17,24,39,0.95) 0%, rgba(10,14,26,0.95) 100%);
+      backdrop-filter: var(--glass);
+      border-bottom: 1px solid var(--border);
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    .top-left { display: flex; align-items: center; gap: 16px; }
+    .logo {
+      width: 40px; height: 40px;
+      background: linear-gradient(135deg, var(--accent), #818cf8);
+      border-radius: 10px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 20px;
+      box-shadow: 0 0 20px var(--accent-glow);
+    }
+    .title { font-weight: 700; font-size: 18px; letter-spacing: -0.3px; }
+    .sub { font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
+    .role-badge {
+      padding: 3px 10px;
+      border-radius: 99px;
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-left: 10px;
+      vertical-align: middle;
+    }
+    .role-badge.admin { background: rgba(239,68,68,0.15); color: #fca5a5; border: 1px solid rgba(239,68,68,0.3); }
+    .role-badge.viewer { background: rgba(59,130,246,0.15); color: #93c5fd; border: 1px solid rgba(59,130,246,0.3); }
+    #clock { font-size: 13px; color: var(--text-secondary); font-variant-numeric: tabular-nums; font-weight: 500; }
+
+    /* ─── Layout ─── */
+    .layout {
+      display: grid;
+      grid-template-columns: 1fr 380px;
+      gap: 16px;
+      padding: 16px 24px 24px;
+      max-width: 1920px;
+      margin: 0 auto;
+    }
+    .main { display: flex; flex-direction: column; gap: 16px; }
+    .side { display: flex; flex-direction: column; gap: 16px; }
+
+    /* ─── Cards ─── */
+    .card {
+      background: var(--bg-card);
+      backdrop-filter: var(--glass);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      box-shadow: var(--shadow);
+      transition: border-color 0.2s, box-shadow 0.2s;
+    }
+    .card:hover { border-color: var(--border-hover); }
+    .card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      background: rgba(0,0,0,0.2);
+    }
+    .card-header h3 {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-primary);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .card-header .badge {
+      font-size: 11px;
+      color: var(--text-muted);
+      font-weight: 400;
+    }
+
+    /* ─── Controls ─── */
+    .controls-toggle {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 16px;
+      cursor: pointer;
+      user-select: none;
+    }
+    .controls-toggle:hover { background: rgba(255,255,255,0.02); }
+    .controls-body { padding: 0 16px 16px; }
+    .filter-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 10px;
+    }
+    .field label {
+      display: block;
+      font-size: 10px;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 4px;
+    }
+    .field input, .field select {
+      width: 100%;
+      background: var(--bg-input);
+      color: var(--text-primary);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 7px 10px;
+      font-size: 12px;
+      font-family: inherit;
+      transition: border-color 0.2s, box-shadow 0.2s;
+      outline: none;
+    }
+    .field input:focus, .field select:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-glow);
+    }
+    .actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 12px;
+      flex-wrap: wrap;
+    }
+    .btn {
+      font-family: inherit;
+      font-size: 12px;
+      font-weight: 500;
+      padding: 7px 14px;
+      border: none;
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      transition: all 0.15s;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .btn-primary { background: var(--accent); color: white; }
+    .btn-primary:hover { background: #5558e6; box-shadow: 0 0 16px var(--accent-glow); }
+    .btn-secondary { background: rgba(255,255,255,0.06); color: var(--text-secondary); }
+    .btn-secondary:hover { background: rgba(255,255,255,0.1); color: var(--text-primary); }
+    .btn-outline { background: transparent; color: var(--text-secondary); border: 1px solid var(--border); }
+    .btn-outline:hover { border-color: var(--accent); color: var(--accent); }
+    .btn-outline.active { background: rgba(16,185,129,0.1); border-color: var(--green); color: var(--green); }
+    .btn-danger { background: rgba(239,68,68,0.15); color: #fca5a5; border: 1px solid rgba(239,68,68,0.2); }
+    .btn-danger:hover { background: rgba(239,68,68,0.25); }
+    .btn-sm {
+      font-family: inherit;
+      background: rgba(255,255,255,0.06);
+      color: var(--text-secondary);
+      border: 1px solid transparent;
+      border-radius: 6px;
+      padding: 3px 10px;
+      font-size: 11px;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .btn-sm:hover { background: rgba(255,255,255,0.1); color: var(--text-primary); border-color: var(--border); }
+    .btn-sm.pin-on { background: rgba(124,58,237,0.15); color: #c4b5fd; border-color: rgba(124,58,237,0.3); }
+    .btn-sm.restart { background: rgba(239,68,68,0.1); color: #fca5a5; }
+    .btn-sm.restart:hover { background: rgba(239,68,68,0.2); }
+
+    .status-bar {
+      display: flex;
+      justify-content: space-between;
+      padding: 8px 16px;
+      font-size: 11px;
+      color: var(--text-muted);
+      border-top: 1px solid var(--border);
+    }
+
+    /* ─── Video Grid ─── */
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+    .grid.focus-mode .vid-card { display: none; }
+    .grid.focus-mode .vid-card.focused { display: block; grid-column: 1 / -1; }
+    .grid.focus-mode .vid-card.focused img { height: 560px; }
+
+    .vid-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      transition: all 0.3s;
+      position: relative;
+    }
+    .vid-card:hover { border-color: var(--border-hover); transform: translateY(-1px); box-shadow: var(--shadow-lg); }
+    .vid-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 10px 14px;
+      background: rgba(0,0,0,0.3);
+    }
+    .vid-title { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; }
+    .vid-tools { display: flex; gap: 4px; }
+    .status-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      display: inline-block;
+    }
+    .status-dot.online { background: var(--green); box-shadow: 0 0 8px rgba(16,185,129,0.5); }
+    .status-dot.offline { background: var(--red); box-shadow: 0 0 8px rgba(239,68,68,0.5); animation: pulse 2s infinite; }
+    .status-dot.checking { background: var(--amber); }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+    .status-label { font-size: 11px; font-weight: 600; }
+    .status-label.ok { color: var(--green); }
+    .status-label.bad { color: var(--red); }
+    .status-label.warn { color: var(--amber); }
+
+    .vid-card img {
+      width: 100%;
+      height: 260px;
+      object-fit: contain;
+      background: #000;
+      display: block;
+      border-top: 1px solid rgba(255,255,255,0.03);
+      border-bottom: 1px solid rgba(255,255,255,0.03);
+    }
+    .vid-meta {
+      font-size: 11px;
+      color: var(--text-muted);
+      padding: 8px 14px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* ─── Events ─── */
+    .events { max-height: 520px; overflow-y: auto; padding: 12px; }
+    .events::-webkit-scrollbar { width: 4px; }
+    .events::-webkit-scrollbar-track { background: transparent; }
+    .events::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 4px; }
+
+    .ev {
+      border-radius: var(--radius-sm);
+      padding: 10px 12px;
+      margin-bottom: 8px;
+      background: rgba(0,0,0,0.25);
+      border-left: 3px solid transparent;
+      transition: all 0.2s;
+      animation: slideIn 0.3s ease-out;
+    }
+    @keyframes slideIn { from { opacity: 0; transform: translateX(-8px); } to { opacity: 1; transform: translateX(0); } }
+    .ev:hover { background: rgba(0,0,0,0.35); }
+    .ev.fall { border-left-color: var(--red); }
+    .ev.fight { border-left-color: var(--amber); }
+    .ev.channel_recovery { border-left-color: var(--blue); }
+    .ev .line {
+      font-size: 13px;
+      font-weight: 500;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+      margin-bottom: 4px;
+    }
+    .ev .meta {
+      font-size: 11px;
+      color: var(--text-muted);
+      line-height: 1.5;
+    }
+
+    .pill {
+      padding: 2px 8px;
+      border-radius: 99px;
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+    }
+    .pill.fall { background: rgba(239,68,68,0.15); color: #fca5a5; }
+    .pill.fight { background: rgba(245,158,11,0.15); color: #fcd34d; }
+    .pill.channel_recovery { background: rgba(59,130,246,0.15); color: #93c5fd; }
+    .pill.critical { background: rgba(239,68,68,0.15); color: #fca5a5; }
+    .pill.warning { background: rgba(245,158,11,0.15); color: #fcd34d; }
+    .pill.normal { background: rgba(59,130,246,0.15); color: #93c5fd; }
+
+    .hint {
+      font-size: 11px;
+      color: var(--text-muted);
+      padding: 10px 16px;
+      border-top: 1px solid var(--border);
+      line-height: 1.6;
+    }
+
+    /* ─── Stats ─── */
+    .stats-grid { padding: 12px 16px; }
+    .stat-section { margin-bottom: 12px; }
+    .stat-section:last-child { margin-bottom: 0; }
+    .stat-section strong {
+      font-size: 11px;
+      color: var(--text-secondary);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      display: block;
+      margin-bottom: 6px;
+    }
+    .stat-bar-container { margin-bottom: 4px; }
+    .stat-bar-label {
+      display: flex;
+      justify-content: space-between;
+      font-size: 11px;
+      color: var(--text-secondary);
+      margin-bottom: 2px;
+    }
+    .stat-bar {
+      height: 6px;
+      background: rgba(255,255,255,0.05);
+      border-radius: 3px;
+      overflow: hidden;
+    }
+    .stat-bar-fill {
+      height: 100%;
+      border-radius: 3px;
+      transition: width 0.6s ease;
+      background: linear-gradient(90deg, var(--accent), #818cf8);
+    }
+    .stat-bar-fill.type-fall { background: linear-gradient(90deg, #ef4444, #f87171); }
+    .stat-bar-fill.type-fight { background: linear-gradient(90deg, #f59e0b, #fbbf24); }
+    .stat-bar-fill.sev-critical { background: linear-gradient(90deg, #ef4444, #f87171); }
+    .stat-bar-fill.sev-warning { background: linear-gradient(90deg, #f59e0b, #fbbf24); }
+    .stat-bar-fill.sev-normal { background: linear-gradient(90deg, #3b82f6, #60a5fa); }
+
+    @media (max-width: 1400px) {
+      .layout { grid-template-columns: 1fr; }
+      .side { flex-direction: row; flex-wrap: wrap; }
+      .side > .card { flex: 1; min-width: 300px; }
+    }
+    @media (max-width: 900px) {
+      .filter-grid { grid-template-columns: repeat(2, 1fr); }
+      .grid { grid-template-columns: 1fr; }
+      .layout { padding: 12px; }
     }
   </style>
 </head>
 <body>
   <div class="top">
-    <div>
-      <div class="title">
-        승강기 이상상황 통합 대시보드 (4채널)
-        <span id="roleBadge" class="role-badge" style="display:none;"></span>
+    <div class="top-left">
+      <div class="logo">🛗</div>
+      <div>
+        <div class="title">
+          승강기 이상감지 관제
+          <span id="roleBadge" class="role-badge" style="display:none;"></span>
+        </div>
+        <div class="sub">4채널 실시간 모니터링 · 이벤트 관제 · 자동 복구</div>
       </div>
-      <div class="sub">실시간 모니터링 + 이벤트 알람 + 운영 필터</div>
     </div>
-    <div id="clock" class="sub"></div>
+    <div id="clock"></div>
   </div>
 
   <div class="layout">
     <div class="main">
+      <!-- Controls -->
       <div class="card">
-        <div class="head"><strong>운영 제어</strong><span id="modeText" class="sub"></span></div>
-        <div class="controls">
-          <div class="row-4">
+        <div class="controls-toggle" onclick="document.getElementById('controlsBody').style.display = document.getElementById('controlsBody').style.display === 'none' ? 'block' : 'none'">
+          <h3 style="font-size:13px;font-weight:600;display:flex;align-items:center;gap:8px;">
+            ⚙️ 운영 제어
+          </h3>
+          <span id="modeText" class="badge" style="font-size:11px;color:var(--text-muted);"></span>
+        </div>
+        <div id="controlsBody" class="controls-body">
+          <div class="filter-grid">
             <div class="field">
               <label>채널</label>
               <select id="fChannel"><option value="">전체</option></select>
@@ -174,39 +520,36 @@ HTML = """
               <label>이벤트 유형</label>
               <select id="fType">
                 <option value="">전체</option>
-                <option value="fall">fall</option>
-                <option value="fight">fight</option>
+                <option value="fall">fall (쓰러짐)</option>
+                <option value="fight">fight (싸움)</option>
               </select>
             </div>
             <div class="field">
               <label>심각도</label>
               <select id="fSeverity">
                 <option value="">전체</option>
-                <option value="critical">critical</option>
-                <option value="warning">warning</option>
-                <option value="normal">normal</option>
+                <option value="critical">🔴 critical</option>
+                <option value="warning">🟡 warning</option>
+                <option value="normal">🔵 normal</option>
               </select>
             </div>
             <div class="field">
               <label>최소 신뢰도</label>
-              <input id="fMinScore" type="number" min="0" max="1" step="0.01" placeholder="예: 0.85" />
+              <input id="fMinScore" type="number" min="0" max="1" step="0.01" placeholder="0.85" />
             </div>
-          </div>
-
-          <div class="row-4">
             <div class="field">
-              <label>검색(raw line)</label>
-              <input id="fQ" type="text" placeholder="키워드" />
+              <label>키워드 검색</label>
+              <input id="fQ" type="text" placeholder="raw line 검색..." />
             </div>
             <div class="field">
               <label>정렬</label>
               <select id="fSort">
-                <option value="desc">최신순(desc)</option>
-                <option value="asc">과거순(asc)</option>
+                <option value="desc">최신순 ↓</option>
+                <option value="asc">과거순 ↑</option>
               </select>
             </div>
             <div class="field">
-              <label>조회 구간(분)</label>
+              <label>조회 구간</label>
               <select id="fWindowMin">
                 <option value="0">전체</option>
                 <option value="10">최근 10분</option>
@@ -217,7 +560,7 @@ HTML = """
               </select>
             </div>
             <div class="field">
-              <label>순환 주기(초)</label>
+              <label>순환 주기</label>
               <select id="cycleSec">
                 <option value="5">5초</option>
                 <option value="10" selected>10초</option>
@@ -226,42 +569,50 @@ HTML = """
               </select>
             </div>
           </div>
-
           <div class="actions">
-            <button class="btn" id="btnApply">필터 적용</button>
-            <button class="btn secondary" id="btnReset">필터 초기화</button>
-            <button class="btn ghost" id="btnCycle">순환 표시 시작</button>
-            <button class="btn ghost" id="btnExitFocus">확대 해제</button>
+            <button class="btn btn-primary" id="btnApply">필터 적용</button>
+            <button class="btn btn-secondary" id="btnReset">초기화</button>
+            <button class="btn btn-outline" id="btnCycle">🔄 순환 시작</button>
+            <button class="btn btn-outline" id="btnExitFocus">↩ 확대 해제</button>
           </div>
         </div>
-        <div class="status-line">
-          <span id="focusInfo">확대 채널: 없음</span>
-          <span id="pinInfo">고정 채널: 없음</span>
+        <div class="status-bar">
+          <span id="focusInfo">확대: 없음</span>
+          <span id="pinInfo">고정: 없음</span>
         </div>
       </div>
 
+      <!-- Video Grid -->
       <div class="grid" id="grid"></div>
     </div>
 
     <div class="side">
+      <!-- Events -->
       <div class="card">
-        <div class="head"><strong>실시간 알람</strong><span id="evCount" class="sub"></span></div>
+        <div class="card-header">
+          <h3>🔔 실시간 알람</h3>
+          <span id="evCount" class="badge"></span>
+        </div>
         <div class="events" id="events"></div>
-        <div class="hint">필터가 비활성인 경우 `since` 기반 실시간 증분 폴링으로 동작</div>
+        <div class="hint">필터 비활성 시 since 기반 증분 폴링</div>
       </div>
 
+      <!-- Stats -->
       <div class="card">
-        <div class="head"><strong>이벤트 통계</strong><span class="sub" id="statsWindowText"></span></div>
-        <div class="stats-grid" id="statsBody">통계 로딩중...</div>
+        <div class="card-header">
+          <h3>📊 이벤트 통계</h3>
+          <span class="badge" id="statsWindowText"></span>
+        </div>
+        <div class="stats-grid" id="statsBody">로딩중...</div>
       </div>
 
+      <!-- Memo -->
       <div class="card">
-        <div class="head"><strong>운영 메모</strong></div>
+        <div class="card-header"><h3>📋 운영 정보</h3></div>
         <div class="hint">
-          - Webcam은 장치 점유 특성상 추론/미리보기 동시 사용이 제한될 수 있음<br/>
-          - Telegram/Webhook 알람은 서버 환경변수 설정 시 자동 전송<br/>
-          - 카드별 버튼: 확대/고정, 순환표시와 연동<br/>
-          - 알림 정책: critical=즉시, warning=5분 다이제스트, info=로그만
+          알림 정책: 🔴 critical → 즉시 전송 · 🟡 warning → 5분 다이제스트 · 🔵 info → 로그만<br/>
+          헬스체크: 30초 주기 · 3회 연속 실패 시 자동 복구<br/>
+          Webcam은 장치 점유 특성상 추론/미리보기 동시 사용 제한
         </div>
       </div>
     </div>
@@ -336,26 +687,27 @@ function makeGrid(){
   grid.innerHTML = '';
   channels.forEach(ch => {
     const restartBtn = userRole === 'admin'
-      ? `<button class="btn-sm" data-action="restart" data-channel="${ch.id}" style="background:#dc2626;">재시작</button>`
+      ? `<button class="btn-sm restart" data-action="restart" data-channel="${ch.id}">재시작</button>`
       : '';
     const card = document.createElement('div');
-    card.className = 'card';
+    card.className = 'vid-card';
     card.id = `card_${ch.id}`;
     card.dataset.channelId = ch.id;
     card.innerHTML = `
-      <div class="head">
-        <div class="head-title">
+      <div class="vid-header">
+        <div class="vid-title">
+          <span class="status-dot checking" id="dot_${ch.id}"></span>
           <strong>${ch.name}</strong>
-          <span id="st_${ch.id}" class="warn">확인중...</span>
+          <span id="st_${ch.id}" class="status-label warn">확인중</span>
         </div>
-        <div class="head-tools">
+        <div class="vid-tools">
           <button class="btn-sm" data-action="focus" data-channel="${ch.id}">확대</button>
           <button class="btn-sm" id="pin_${ch.id}" data-action="pin" data-channel="${ch.id}">고정</button>
           ${restartBtn}
         </div>
       </div>
       <img id="img_${ch.id}" src="${streamUrl(ch.port)}" alt="${ch.name}"/>
-      <div class="stats" id="meta_${ch.id}">port:${ch.port}</div>
+      <div class="vid-meta" id="meta_${ch.id}">port: ${ch.port}</div>
     `;
     grid.appendChild(card);
   });
@@ -368,9 +720,7 @@ function makeGrid(){
     if(action === 'focus'){
       if(state.focusedChannelId === channelId) setFocusedChannel(null);
       else setFocusedChannel(channelId);
-      if(state.cycleEnabled){
-        stopCycle();
-      }
+      if(state.cycleEnabled) stopCycle();
     }
     if(action === 'pin') togglePin(channelId);
     if(action === 'restart') restartChannel(channelId);
@@ -384,11 +734,9 @@ async function restartChannel(channelId){
     if(pageToken) params.set('token', pageToken);
     const r = await fetch(`/api/channels/${channelId}/restart?${params.toString()}`, {method:'POST'});
     const j = await r.json();
-    if(r.ok) alert(`${channelId} 재시작 요청 완료: ${j.message || 'ok'}`);
+    if(r.ok) alert(`${channelId} 재시작 완료`);
     else alert(`재시작 실패: ${j.error || j.message || r.status}`);
-  } catch(e) {
-    alert(`재시작 요청 실패: ${e.message}`);
-  }
+  } catch(e) { alert(`재시작 요청 실패: ${e.message}`); }
 }
 
 function setFocusedChannel(channelId){
@@ -404,7 +752,7 @@ function setFocusedChannel(channelId){
   });
 
   const focusName = channels.find(c => c.id === state.focusedChannelId)?.name || '없음';
-  document.getElementById('focusInfo').textContent = `확대 채널: ${focusName}`;
+  document.getElementById('focusInfo').textContent = `확대: ${focusName}`;
 }
 
 function togglePin(channelId){
@@ -415,11 +763,11 @@ function togglePin(channelId){
     const btn = document.getElementById(`pin_${ch.id}`);
     if(!btn) return;
     btn.classList.toggle('pin-on', state.pinned.has(ch.id));
-    btn.textContent = state.pinned.has(ch.id) ? '고정됨' : '고정';
+    btn.textContent = state.pinned.has(ch.id) ? '📌 고정됨' : '고정';
   });
 
   const pinNames = channels.filter(ch => state.pinned.has(ch.id)).map(ch => ch.name);
-  document.getElementById('pinInfo').textContent = `고정 채널: ${pinNames.length ? pinNames.join(', ') : '없음'}`;
+  document.getElementById('pinInfo').textContent = `고정: ${pinNames.length ? pinNames.join(', ') : '없음'}`;
 }
 
 function cycleCandidates(){
@@ -444,18 +792,15 @@ function startCycle(){
   advanceCycle();
   if(state.cycleTimer) clearInterval(state.cycleTimer);
   state.cycleTimer = setInterval(advanceCycle, intervalMs);
-  document.getElementById('btnCycle').textContent = '순환 표시 중지';
+  document.getElementById('btnCycle').textContent = '⏹ 순환 중지';
   document.getElementById('btnCycle').classList.add('active');
   updateModeText();
 }
 
 function stopCycle(){
   state.cycleEnabled = false;
-  if(state.cycleTimer){
-    clearInterval(state.cycleTimer);
-    state.cycleTimer = null;
-  }
-  document.getElementById('btnCycle').textContent = '순환 표시 시작';
+  if(state.cycleTimer){ clearInterval(state.cycleTimer); state.cycleTimer = null; }
+  document.getElementById('btnCycle').textContent = '🔄 순환 시작';
   document.getElementById('btnCycle').classList.remove('active');
   updateModeText();
 }
@@ -463,15 +808,16 @@ function stopCycle(){
 function updateModeText(){
   const filterOn = hasActiveFilters();
   const parts = [];
-  parts.push(filterOn ? '필터 모드' : '실시간 모드(since 증분)');
+  parts.push(filterOn ? '필터 모드' : '실시간 모드');
   if(state.cycleEnabled) parts.push('순환 ON');
-  if(state.focusedChannelId) parts.push(`확대:${state.focusedChannelId}`);
-  document.getElementById('modeText').textContent = parts.join(' | ');
+  if(state.focusedChannelId) parts.push(`확대: ${state.focusedChannelId}`);
+  document.getElementById('modeText').textContent = parts.join(' · ');
 }
 
 async function refreshStatus(){
   for (const ch of channels){
     const stEl = document.getElementById(`st_${ch.id}`);
+    const dotEl = document.getElementById(`dot_${ch.id}`);
     const meta = document.getElementById(`meta_${ch.id}`);
     const started = performance.now();
     try {
@@ -479,38 +825,33 @@ async function refreshStatus(){
       if(!r.ok) throw new Error(`HTTP ${r.status}`);
       const j = await r.json();
       const latencyMs = Math.round(performance.now() - started);
-      state.channelHealth[ch.id] = {
-        online: true,
-        latencyMs,
-        fps: j.fps || 0,
-        frames: j.frames || 0,
-        lastOkAt: Date.now(),
-      };
+      state.channelHealth[ch.id] = { online:true, latencyMs, fps:j.fps||0, frames:j.frames||0, lastOkAt:Date.now() };
       stEl.textContent = 'ONLINE';
-      stEl.className = 'ok';
-      const fpsText = (j.fps || 0).toFixed ? (j.fps || 0).toFixed(2) : j.fps;
-      meta.textContent = `fps:${fpsText} | frames:${j.frames || 0} | 지연:${latencyMs}ms | 마지막프레임:${formatTime(Date.now())}`;
+      stEl.className = 'status-label ok';
+      dotEl.className = 'status-dot online';
+      const fpsText = (j.fps || 0).toFixed ? (j.fps || 0).toFixed(1) : j.fps;
+      meta.textContent = `${fpsText} fps · ${j.frames||0} frames · ${latencyMs}ms 지연`;
     } catch(e){
       const prev = state.channelHealth[ch.id] || {};
       state.channelHealth[ch.id] = { ...prev, online:false };
       stEl.textContent = 'OFFLINE';
-      stEl.className = 'bad';
+      stEl.className = 'status-label bad';
+      dotEl.className = 'status-dot offline';
       const lastOk = prev.lastOkAt ? formatTime(prev.lastOkAt) : '-';
-      meta.textContent = `port:${ch.port} 연결 실패 | 마지막 정상:${lastOk}`;
+      meta.textContent = `연결 실패 · 마지막 정상: ${lastOk}`;
     }
   }
 }
 
 function beep(){
-  const ctx = new (window.AudioContext || window.webkitAudioContext)();
-  const o = ctx.createOscillator();
-  const g = ctx.createGain();
-  o.type = 'sine';
-  o.frequency.value = 880;
-  g.gain.value = 0.05;
-  o.connect(g); g.connect(ctx.destination);
-  o.start();
-  setTimeout(() => { o.stop(); ctx.close(); }, 180);
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const o = ctx.createOscillator();
+    const g = ctx.createGain();
+    o.type = 'sine'; o.frequency.value = 880; g.gain.value = 0.04;
+    o.connect(g); g.connect(ctx.destination);
+    o.start(); setTimeout(() => { o.stop(); ctx.close(); }, 150);
+  } catch(e){}
 }
 
 function eventCardHtml(ev){
@@ -523,10 +864,9 @@ function eventCardHtml(ev){
       <div class="line">
         <span class="pill ${type}">${escapeHtml(String(type).toUpperCase())}</span>
         <span class="pill ${severity}">${escapeHtml(severity)}</span>
-        <span>${escapeHtml(ev.channel_name || ev.channel_id || ev.channel || '-')}</span>
+        <span style="color:var(--text-secondary)">${escapeHtml(ev.channel_name || ev.channel_id || ev.channel || '-')}</span>
       </div>
-      <div class="meta">score=${score} | ${escapeHtml(timeStr)} | source=${escapeHtml(ev.source || '-')}</div>
-      <div class="meta">${escapeHtml(ev.raw_line || '')}</div>
+      <div class="meta">신뢰도 ${score} · ${escapeHtml(timeStr)} · ${escapeHtml(ev.source || '-')}</div>
     </div>
   `;
 }
@@ -535,8 +875,7 @@ function setEvents(events){
   const box = document.getElementById('events');
   const count = document.getElementById('evCount');
   box.innerHTML = events.map(eventCardHtml).join('');
-  count.textContent = `조회 ${events.length}건`;
-
+  count.textContent = `${events.length}건`;
   if(events.length > 0){
     const topId = Math.max(...events.map(e => e.id || 0));
     if(topId > state.lastRenderedTopId) beep();
@@ -551,16 +890,14 @@ function prependEvents(events){
   events.slice().reverse().forEach(ev => {
     box.insertAdjacentHTML('afterbegin', eventCardHtml(ev));
   });
-  while (box.children.length > 160) box.removeChild(box.lastChild);
-  count.textContent = `최근 ${box.children.length}건`;
+  while(box.children.length > 160) box.removeChild(box.lastChild);
+  count.textContent = `${box.children.length}건`;
   beep();
 }
 
 function hasActiveFilters(){
   const f = state.filters;
-  return Boolean(
-    f.channel || f.type || f.severity || f.minScore || f.q || f.windowMin !== '0' || f.sort === 'asc'
-  );
+  return Boolean(f.channel || f.type || f.severity || f.minScore || f.q || f.windowMin !== '0' || f.sort === 'asc');
 }
 
 function readFilterInputs(){
@@ -588,12 +925,7 @@ function resetFilterInputs(){
 function buildEventQuery(incremental){
   const params = new URLSearchParams();
   params.set('limit', hasActiveFilters() ? '160' : '80');
-
-  if(incremental){
-    params.set('since', String(state.lastEventId));
-    return params;
-  }
-
+  if(incremental){ params.set('since', String(state.lastEventId)); return params; }
   const f = state.filters;
   if(f.channel) params.set('channel', f.channel);
   if(f.type) params.set('type', f.type);
@@ -601,14 +933,12 @@ function buildEventQuery(incremental){
   if(f.minScore) params.set('min_score', f.minScore);
   if(f.q) params.set('q', f.q);
   if(f.sort) params.set('sort', f.sort);
-
   const windowMin = parseInt(f.windowMin || '0', 10);
   if(windowMin > 0){
     const nowSec = Math.floor(Date.now() / 1000);
     params.set('from_ts', String(nowSec - windowMin * 60));
     params.set('to_ts', String(nowSec));
   }
-
   return params;
 }
 
@@ -620,17 +950,12 @@ async function pollEvents(){
     if(!r.ok) throw new Error(`HTTP ${r.status}`);
     const j = await r.json();
     const events = Array.isArray(j.events) ? j.events : [];
-
     if(events.length > 0){
       const maxId = Math.max(...events.map(e => e.id || 0));
       state.lastEventId = Math.max(state.lastEventId, maxId);
     }
-
-    if(incremental){
-      prependEvents(events);
-    } else {
-      setEvents(events);
-    }
+    if(incremental) prependEvents(events);
+    else setEvents(events);
   } catch(e) {}
 }
 
@@ -649,10 +974,19 @@ function buildStatsQuery(){
   return params;
 }
 
-function listHtml(title, data){
+function renderStatBars(title, data, cssPrefix){
   const entries = Object.entries(data || {});
-  if(entries.length === 0) return `<div><strong>${title}</strong><ul><li>없음</li></ul></div>`;
-  return `<div><strong>${title}</strong><ul>${entries.map(([k,v]) => `<li>${escapeHtml(k)}: ${v}</li>`).join('')}</ul></div>`;
+  if(!entries.length) return `<div class="stat-section"><strong>${title}</strong><div style="font-size:11px;color:var(--text-muted);">데이터 없음</div></div>`;
+  const maxVal = Math.max(...entries.map(([_,v])=>v), 1);
+  const bars = entries.map(([k,v]) => {
+    const pct = Math.round(v / maxVal * 100);
+    const cls = cssPrefix ? `${cssPrefix}-${k}` : '';
+    return `<div class="stat-bar-container">
+      <div class="stat-bar-label"><span>${escapeHtml(k)}</span><span>${v}</span></div>
+      <div class="stat-bar"><div class="stat-bar-fill ${cls}" style="width:${pct}%"></div></div>
+    </div>`;
+  }).join('');
+  return `<div class="stat-section"><strong>${title}</strong>${bars}</div>`;
 }
 
 async function pollStats(){
@@ -663,9 +997,9 @@ async function pollStats(){
     const j = await r.json();
     const s = j.stats || {};
     document.getElementById('statsBody').innerHTML = [
-      listHtml('유형별', s.by_type),
-      listHtml('채널별', s.by_channel),
-      listHtml('심각도별', s.by_severity),
+      renderStatBars('유형별', s.by_type, 'type'),
+      renderStatBars('채널별', s.by_channel, ''),
+      renderStatBars('심각도별', s.by_severity, 'sev'),
     ].join('');
   } catch(e){
     document.getElementById('statsBody').textContent = '통계 조회 실패';
@@ -673,31 +1007,16 @@ async function pollStats(){
 }
 
 function bindControlEvents(){
-  document.getElementById('btnApply').addEventListener('click', () => {
-    readFilterInputs();
-    pollEvents();
-    pollStats();
-  });
-
-  document.getElementById('btnReset').addEventListener('click', () => {
-    resetFilterInputs();
-    pollEvents();
-    pollStats();
-  });
-
-  document.getElementById('btnCycle').addEventListener('click', () => {
-    if(state.cycleEnabled) stopCycle();
-    else startCycle();
-  });
-
-  document.getElementById('btnExitFocus').addEventListener('click', () => {
-    setFocusedChannel(null);
-    updateModeText();
-  });
+  document.getElementById('btnApply').addEventListener('click', () => { readFilterInputs(); pollEvents(); pollStats(); });
+  document.getElementById('btnReset').addEventListener('click', () => { resetFilterInputs(); pollEvents(); pollStats(); });
+  document.getElementById('btnCycle').addEventListener('click', () => { if(state.cycleEnabled) stopCycle(); else startCycle(); });
+  document.getElementById('btnExitFocus').addEventListener('click', () => { setFocusedChannel(null); updateModeText(); });
 }
 
 function tickClock(){
-  document.getElementById('clock').textContent = new Date().toLocaleString();
+  const now = new Date();
+  const opts = { year:'numeric', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false };
+  document.getElementById('clock').textContent = now.toLocaleString('ko-KR', opts);
 }
 
 showRoleBadge();
@@ -718,6 +1037,7 @@ tickClock();
 </body>
 </html>
 """
+
 
 
 # ---------------------------------------------------------------------------
