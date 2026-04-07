@@ -81,6 +81,30 @@ ALERT_DIGEST_INTERVAL_SEC = int(os.getenv("ALERT_DIGEST_INTERVAL_SEC", "300"))
 HEALTH_CHECK_INTERVAL_SEC = int(os.getenv("HEALTH_CHECK_INTERVAL_SEC", "30"))
 HEALTH_MAX_FAILURES = int(os.getenv("HEALTH_MAX_FAILURES", "3"))
 
+
+def _service_active(service_name: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "is-active", service_name],
+            capture_output=True, text=True, timeout=5,
+        )
+        return result.returncode == 0 and result.stdout.strip() == "active"
+    except Exception:
+        return False
+
+
+def _augment_channel_health(channel_health: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    enriched: Dict[str, Dict[str, Any]] = {}
+    for ch in CHANNELS:
+        state = dict(channel_health.get(ch["id"], {}))
+        ds_service = f"elevator-ds-{ch['id']}.service"
+        state["inference"] = {
+            "service": ds_service,
+            "active": _service_active(ds_service),
+        }
+        enriched[ch["id"]] = state
+    return enriched
+
 HTML = """
 <!doctype html>
 <html lang="ko">
@@ -815,30 +839,48 @@ function updateModeText(){
 }
 
 async function refreshStatus(){
+  let runtimeHealth = {};
+  try {
+    const params = withToken(new URLSearchParams());
+    const hr = await fetch(`/api/health?${params.toString()}`, {cache:'no-store'});
+    if(hr.ok){
+      const hj = await hr.json();
+      runtimeHealth = hj.channels || {};
+    }
+  } catch(e) {}
+
   for (const ch of channels){
     const stEl = document.getElementById(`st_${ch.id}`);
     const dotEl = document.getElementById(`dot_${ch.id}`);
     const meta = document.getElementById(`meta_${ch.id}`);
     const started = performance.now();
+    const inferenceActive = !!(runtimeHealth[ch.id] && runtimeHealth[ch.id].inference && runtimeHealth[ch.id].inference.active);
     try {
       const r = await fetch(statsUrl(ch.port), {cache:'no-store'});
       if(!r.ok) throw new Error(`HTTP ${r.status}`);
       const j = await r.json();
       const latencyMs = Math.round(performance.now() - started);
-      state.channelHealth[ch.id] = { online:true, latencyMs, fps:j.fps||0, frames:j.frames||0, lastOkAt:Date.now() };
-      stEl.textContent = 'ONLINE';
-      stEl.className = 'status-label ok';
+      state.channelHealth[ch.id] = { online:true, latencyMs, fps:j.fps||0, frames:j.frames||0, lastOkAt:Date.now(), inferenceActive };
+      stEl.textContent = inferenceActive ? 'LIVE + AI' : 'LIVE';
+      stEl.className = inferenceActive ? 'status-label ok' : 'status-label warn';
       dotEl.className = 'status-dot online';
       const fpsText = (j.fps || 0).toFixed ? (j.fps || 0).toFixed(1) : j.fps;
-      meta.textContent = `${fpsText} fps · ${j.frames||0} frames · ${latencyMs}ms 지연`;
+      meta.textContent = `${fpsText} fps · ${j.frames||0} frames · ${latencyMs}ms 지연 · ${inferenceActive ? 'AI ON' : 'AI OFF'}`;
     } catch(e){
       const prev = state.channelHealth[ch.id] || {};
-      state.channelHealth[ch.id] = { ...prev, online:false };
-      stEl.textContent = 'OFFLINE';
-      stEl.className = 'status-label bad';
-      dotEl.className = 'status-dot offline';
+      state.channelHealth[ch.id] = { ...prev, online:false, inferenceActive };
       const lastOk = prev.lastOkAt ? formatTime(prev.lastOkAt) : '-';
-      meta.textContent = `연결 실패 · 마지막 정상: ${lastOk}`;
+      if(inferenceActive){
+        stEl.textContent = 'AI ONLY';
+        stEl.className = 'status-label warn';
+        dotEl.className = 'status-dot checking';
+        meta.textContent = `미리보기 연결 실패 · 마지막 정상: ${lastOk} · AI ON`;
+      } else {
+        stEl.textContent = 'OFFLINE';
+        stEl.className = 'status-label bad';
+        dotEl.className = 'status-dot offline';
+        meta.textContent = `연결 실패 · 마지막 정상: ${lastOk} · AI OFF`;
+      }
     }
   }
 }
@@ -1909,7 +1951,7 @@ def create_app(hub: AlertHub):
     @app.route("/api/health")
     @any_role_required
     def health(role="viewer"):
-        channel_health = hub.health_monitor.get_status()
+        channel_health = _augment_channel_health(hub.health_monitor.get_status())
         return jsonify({
             "status": "ok",
             "time": time.time(),
