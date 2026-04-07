@@ -132,8 +132,8 @@ class DeepStreamApp:
             except StopIteration:
                 break
 
-            frame_width = int(getattr(frame_meta, 'source_frame_width', MUXER_OUTPUT_WIDTH) or MUXER_OUTPUT_WIDTH)
-            frame_height = int(getattr(frame_meta, 'source_frame_height', MUXER_OUTPUT_HEIGHT) or MUXER_OUTPUT_HEIGHT)
+            frame_width = MUXER_OUTPUT_WIDTH
+            frame_height = MUXER_OUTPUT_HEIGHT
             overlay_boxes = []
             person_boxes = []
             fallen_now = 0
