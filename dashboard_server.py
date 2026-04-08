@@ -911,6 +911,115 @@ function withToken(params){
   return params;
 }
 
+
+function escapeAttr(value){
+  return escapeHtml(value).replaceAll('"', '&quot;').replaceAll("'", '&#39;');
+}
+
+function sourceHint(type){
+  if(type === 'rtsp') return '예: rtsp://user:pass@ip:554/stream2';
+  if(type === 'file') return '예: /home/ppak/projects/elevator/elve1.mp4';
+  if(type === 'webcam') return '예: 0';
+  return 'disabled면 서비스를 중지합니다';
+}
+
+function renderSourceConfig(){
+  const box = document.getElementById('sourceConfigBody');
+  if(!box) return;
+  const isAdmin = userRole === 'admin';
+  box.innerHTML = channels.map(ch => {
+    const cfg = state.channelSources[ch.id] || {sourceType:'disabled', source:''};
+    const options = [
+      ['disabled', '비활성'],
+      ['rtsp', 'RTSP'],
+      ['file', '파일'],
+      ['webcam', '웹캠'],
+    ].map(([value, label]) => `<option value="${value}" ${cfg.sourceType === value ? 'selected' : ''}>${label}</option>`).join('');
+    return `
+      <div style="padding:10px 0; border-top:1px solid var(--border);">
+        <div style="font-size:12px; font-weight:700; margin-bottom:8px;">${ch.name}</div>
+        <div class="filter-grid" style="grid-template-columns: 120px 1fr;">
+          <div class="field">
+            <label>타입</label>
+            <select data-source-type="${ch.id}" ${isAdmin ? '' : 'disabled'}>${options}</select>
+          </div>
+          <div class="field">
+            <label>입력 소스</label>
+            <input data-source-value="${ch.id}" type="text" value="${escapeAttr(cfg.source || '')}" placeholder="${escapeAttr(sourceHint(cfg.sourceType))}" ${isAdmin ? '' : 'disabled'} />
+          </div>
+        </div>
+        <div class="source-hint" style="margin-top:6px; color:var(--text-muted); font-size:11px;">${sourceHint(cfg.sourceType)}</div>
+      </div>
+    `;
+  }).join('');
+
+  if(!isAdmin){
+    box.innerHTML += '<div style="margin-top:8px; color:var(--text-muted); font-size:11px;">보기 전용 모드입니다. 관리자만 저장/적용할 수 있어요.</div>';
+  }
+
+  box.querySelectorAll('select[data-source-type]').forEach(sel => {
+    sel.addEventListener('change', (ev) => {
+      const channelId = ev.target.dataset.sourceType;
+      const wrapper = ev.target.closest('div[style*="border-top"]');
+      const input = wrapper ? wrapper.querySelector(`[data-source-value="${channelId}"]`) : null;
+      const hint = wrapper ? wrapper.querySelector('.source-hint') : null;
+      if(input) input.placeholder = sourceHint(ev.target.value);
+      if(hint) hint.textContent = sourceHint(ev.target.value);
+    });
+  });
+}
+
+async function loadSourceConfig(){
+  const box = document.getElementById('sourceConfigBody');
+  try {
+    const params = withToken(new URLSearchParams());
+    const r = await fetch(`/api/channel-sources?${params.toString()}`, {cache:'no-store'});
+    if(!r.ok) throw new Error(`HTTP ${r.status}`);
+    const j = await r.json();
+    state.channelSources = j.channels || {};
+    renderSourceConfig();
+  } catch(e){
+    if(box) box.textContent = `설정 불러오기 실패: ${e.message}`;
+  }
+}
+
+function collectSourceConfig(){
+  const next = {};
+  channels.forEach(ch => {
+    const typeEl = document.querySelector(`[data-source-type="${ch.id}"]`);
+    const valueEl = document.querySelector(`[data-source-value="${ch.id}"]`);
+    next[ch.id] = {
+      sourceType: typeEl ? typeEl.value : 'disabled',
+      source: valueEl ? valueEl.value.trim() : '',
+    };
+  });
+  return next;
+}
+
+async function saveSourceConfig(){
+  if(userRole !== 'admin'){
+    alert('관리자만 저장할 수 있어요.');
+    return;
+  }
+  const payload = { channels: collectSourceConfig() };
+  try {
+    const params = withToken(new URLSearchParams());
+    const r = await fetch(`/api/channel-sources?${params.toString()}`, {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(payload),
+    });
+    const j = await r.json();
+    if(!r.ok) throw new Error(j.message || j.error || `HTTP ${r.status}`);
+    state.channelSources = j.channels || payload.channels;
+    renderSourceConfig();
+    await refreshStatus();
+    alert('채널 입력 소스를 저장하고 적용했어요.');
+  } catch(e){
+    alert(`채널 설정 적용 실패: ${e.message}`);
+  }
+}
+
 function showRoleBadge(){
   const badge = document.getElementById('roleBadge');
   if(userRole === 'admin'){
@@ -1281,6 +1390,10 @@ function bindControlEvents(){
   document.getElementById('btnReset').addEventListener('click', () => { resetFilterInputs(); pollEvents(); pollStats(); });
   document.getElementById('btnCycle').addEventListener('click', () => { if(state.cycleEnabled) stopCycle(); else startCycle(); });
   document.getElementById('btnExitFocus').addEventListener('click', () => { setFocusedChannel(null); updateModeText(); });
+  const saveBtn = document.getElementById('btnSaveSources');
+  const reloadBtn = document.getElementById('btnReloadSources');
+  if(saveBtn) saveBtn.addEventListener('click', saveSourceConfig);
+  if(reloadBtn) reloadBtn.addEventListener('click', loadSourceConfig);
 }
 
 function tickClock(){
@@ -1295,6 +1408,7 @@ makeGrid();
 bindControlEvents();
 readFilterInputs();
 updateModeText();
+loadSourceConfig();
 refreshStatus();
 pollEvents();
 pollStats();
