@@ -105,6 +105,218 @@ def _augment_channel_health(channel_health: Dict[str, Dict[str, Any]]) -> Dict[s
         enriched[ch["id"]] = state
     return enriched
 
+
+CHANNEL_CONFIG_PATH = Path("/home/ppak/projects/elevator/channel_sources.json")
+SYSTEMD_USER_DIR = Path.home() / ".config/systemd/user"
+OVERLAY_DIR = Path("/home/ppak/projects/elevator/runtime/overlays")
+PREVIEW_CAPTURE_OPTIONS = "rtsp_transport;udp|fflags;nobuffer|flags;low_delay|max_delay;500000|reorder_queue_size;0"
+SOURCE_TYPE_CHOICES = ("disabled", "rtsp", "file", "webcam")
+CHANNEL_BY_ID = {ch["id"]: ch for ch in CHANNELS}
+
+
+def _infer_source_type(source: str) -> str:
+    src = (source or "").strip()
+    if not src:
+        return "disabled"
+    lower = src.lower()
+    if src.isdigit():
+        return "webcam"
+    if lower.startswith(("rtsp://", "rtmp://", "udp://", "http://", "https://")):
+        return "rtsp"
+    return "file"
+
+
+def _default_channel_sources() -> Dict[str, Dict[str, Any]]:
+    return {
+        ch["id"]: {
+            "id": ch["id"],
+            "name": ch["name"],
+            "sourceType": "disabled",
+            "source": "",
+            "enabled": False,
+        }
+        for ch in CHANNELS
+    }
+
+
+def _normalize_channel_source(channel_id: str, raw: Any) -> Dict[str, Any]:
+    entry = raw if isinstance(raw, dict) else {}
+    source = str(entry.get("source") or "").strip()
+    source_type = str(entry.get("sourceType") or "").strip().lower()
+    if source_type not in SOURCE_TYPE_CHOICES:
+        source_type = _infer_source_type(source)
+    enabled = source_type != "disabled" and bool(source)
+    return {
+        "id": channel_id,
+        "name": CHANNEL_BY_ID[channel_id]["name"],
+        "sourceType": source_type if enabled else "disabled",
+        "source": source if enabled else "",
+        "enabled": enabled,
+    }
+
+
+def _extract_execstart_source(service_path: Path) -> str:
+    if not service_path.exists():
+        return ""
+    try:
+        for line in service_path.read_text().splitlines():
+            if not line.startswith("ExecStart="):
+                continue
+            m = re.search(r'--source\s+(?P<value>"(?:\\.|[^"])*"|\S+)', line)
+            if not m:
+                continue
+            value = m.group("value").strip()
+            if value.startswith('"') and value.endswith('"'):
+                value = value[1:-1].replace('\\"', '"').replace('\\\\', '\\')
+            return value
+    except Exception:
+        return ""
+    return ""
+
+
+def _save_channel_sources(config: Dict[str, Dict[str, Any]]) -> None:
+    payload = {
+        ch["id"]: {
+            "sourceType": config[ch["id"]]["sourceType"],
+            "source": config[ch["id"]]["source"],
+        }
+        for ch in CHANNELS
+    }
+    CHANNEL_CONFIG_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+
+
+def _load_channel_sources() -> Dict[str, Dict[str, Any]]:
+    config = _default_channel_sources()
+    if CHANNEL_CONFIG_PATH.exists():
+        try:
+            raw = json.loads(CHANNEL_CONFIG_PATH.read_text())
+        except Exception:
+            raw = {}
+    else:
+        raw = {}
+        for ch in CHANNELS:
+            service_path = SYSTEMD_USER_DIR / f"elevator-preview-{ch['id']}.service"
+            raw[ch["id"]] = {"source": _extract_execstart_source(service_path)}
+        inferred = {cid: _normalize_channel_source(cid, raw.get(cid, {})) for cid in config}
+        _save_channel_sources(inferred)
+    for ch in CHANNELS:
+        config[ch["id"]] = _normalize_channel_source(ch["id"], raw.get(ch["id"], {}))
+    return config
+
+
+def _quote_unit_arg(value: str) -> str:
+    escaped = str(value).replace('\\', '\\\\').replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _preview_service_text(channel: Dict[str, Any], source: str) -> str:
+    overlay_json = OVERLAY_DIR / f"{channel['id']}.json"
+    return f'''[Unit]
+Description=Elevator preview channel: elevator-preview-{channel['id']}.service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ppak/projects/elevator
+Environment=PYTHONUNBUFFERED=1
+Environment=OPENCV_FFMPEG_CAPTURE_OPTIONS={PREVIEW_CAPTURE_OPTIONS}
+ExecStart=/home/ppak/projects/elevator/venv/bin/python /home/ppak/projects/elevator/preview_server.py --source {_quote_unit_arg(source)} --port {channel['port']} --width 640 --jpeg-quality 65 --overlay-json {_quote_unit_arg(str(overlay_json))}
+Restart=always
+RestartSec=3
+StandardOutput=append:/home/ppak/projects/elevator/logs/elevator-preview-{channel['id']}.out.log
+StandardError=append:/home/ppak/projects/elevator/logs/elevator-preview-{channel['id']}.err.log
+
+[Install]
+WantedBy=default.target
+'''
+
+
+def _ds_service_text(channel: Dict[str, Any], source_type: str, source: str) -> str:
+    overlay_json = OVERLAY_DIR / f"{channel['id']}.json"
+    ds_source = f"http://127.0.0.1:{channel['port']}/video_feed" if source_type == "webcam" else source
+    extra_unit = ""
+    extra_service = ""
+    if source_type == "webcam":
+        extra_unit = f"After=network-online.target elevator-preview-{channel['id']}.service\nWants=network-online.target\nRequires=elevator-preview-{channel['id']}.service\nPartOf=elevator-preview-{channel['id']}.service\n"
+        extra_service = "ExecStartPre=/bin/sleep 2\n"
+    else:
+        extra_unit = "After=network-online.target\nWants=network-online.target\n"
+    return f'''[Unit]
+Description=Elevator DeepStream channel: elevator-ds-{channel['id']}.service
+{extra_unit}
+[Service]
+Type=simple
+WorkingDirectory=/home/ppak/projects/elevator/deepstream_pose
+Environment=PYTHONUNBUFFERED=1
+{extra_service}ExecStart=/usr/bin/python3 /home/ppak/projects/elevator/deepstream_pose/deepstream_pose_simple.py --source {_quote_unit_arg(ds_source)} --no-display --overlay-json {_quote_unit_arg(str(overlay_json))}
+Restart=always
+RestartSec=3
+StandardOutput=append:/home/ppak/projects/elevator/deepstream_pose/logs/elevator-ds-{channel['id']}.out.log
+StandardError=append:/home/ppak/projects/elevator/deepstream_pose/logs/elevator-ds-{channel['id']}.err.log
+
+[Install]
+WantedBy=default.target
+'''
+
+
+def _restart_channel_services(channel_id: str, config: Optional[Dict[str, Dict[str, Any]]] = None) -> Tuple[bool, str]:
+    config = config or _load_channel_sources()
+    if channel_id not in config:
+        return False, f"unknown channel: {channel_id}"
+
+    channel = CHANNEL_BY_ID[channel_id]
+    entry = config[channel_id]
+    preview_service = f"elevator-preview-{channel_id}.service"
+    ds_service = f"elevator-ds-{channel_id}.service"
+    preview_path = SYSTEMD_USER_DIR / preview_service
+    ds_path = SYSTEMD_USER_DIR / ds_service
+    OVERLAY_DIR.mkdir(parents=True, exist_ok=True)
+    if entry["enabled"]:
+        preview_path.write_text(_preview_service_text(channel, entry["source"]))
+        ds_path.write_text(_ds_service_text(channel, entry["sourceType"], entry["source"]))
+
+    subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True, text=True, timeout=20)
+
+    if not entry["enabled"]:
+        subprocess.run(["systemctl", "--user", "stop", ds_service], capture_output=True, text=True, timeout=20)
+        subprocess.run(["systemctl", "--user", "stop", preview_service], capture_output=True, text=True, timeout=20)
+        return True, f"{channel_id} disabled"
+
+    subprocess.run(["systemctl", "--user", "enable", preview_service, ds_service], capture_output=True, text=True, timeout=20)
+    preview_result = subprocess.run(["systemctl", "--user", "restart", preview_service], capture_output=True, text=True, timeout=20)
+    if preview_result.returncode != 0:
+        return False, f"preview restart failed: {preview_result.stderr.strip()}"
+    ds_result = subprocess.run(["systemctl", "--user", "restart", ds_service], capture_output=True, text=True, timeout=20)
+    if ds_result.returncode != 0:
+        return False, f"inference restart failed: {ds_result.stderr.strip()}"
+    return True, f"{channel_id} applied ({entry['sourceType']})"
+
+
+def _validate_channel_sources(config: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
+    errors: Dict[str, str] = {}
+    for channel_id, entry in config.items():
+        source_type = entry["sourceType"]
+        source = entry["source"]
+        if source_type == "disabled":
+            continue
+        if not source:
+            errors[channel_id] = "source is required"
+        elif source_type == "webcam" and not source.isdigit():
+            errors[channel_id] = "webcam source must be a device index like 0"
+        elif source_type == "rtsp" and not source.lower().startswith(("rtsp://", "rtmp://", "udp://", "http://", "https://")):
+            errors[channel_id] = "rtsp source must start with rtsp://, rtmp://, udp://, http://, or https://"
+    return errors
+
+
+def _apply_channel_sources(config: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    _save_channel_sources(config)
+    results: Dict[str, Dict[str, Any]] = {}
+    for ch in CHANNELS:
+        ok, message = _restart_channel_services(ch["id"], config)
+        results[ch["id"]] = {"ok": ok, "message": message}
+    return results
+
 HTML = """
 <!doctype html>
 <html lang="ko">
@@ -630,6 +842,21 @@ HTML = """
         <div class="stats-grid" id="statsBody">로딩중...</div>
       </div>
 
+      <!-- Source Config -->
+      <div class="card">
+        <div class="card-header">
+          <h3>🎛️ 채널 입력 소스 설정</h3>
+          <span class="badge">preview + inference 공통 적용</span>
+        </div>
+        <div class="controls-body">
+          <div id="sourceConfigBody">로딩중...</div>
+          <div style="display:flex; gap:8px; margin-top:12px; flex-wrap:wrap;">
+            <button class="btn" id="btnSaveSources">💾 저장 후 적용</button>
+            <button class="btn btn-outline" id="btnReloadSources">↻ 다시 불러오기</button>
+          </div>
+        </div>
+      </div>
+
       <!-- Memo -->
       <div class="card">
         <div class="card-header"><h3>📋 운영 정보</h3></div>
@@ -664,6 +891,7 @@ const state = {
   cycleIndex: 0,
   cycleTimer: null,
   channelHealth: {},
+  channelSources: {},
 };
 
 function streamUrl(port){ return `http://${location.hostname}:${port}/video_feed`; }
@@ -1948,6 +2176,28 @@ def create_app(hub: AlertHub):
         stats = hub.event_stats(from_ts=from_ts, to_ts=to_ts)
         return jsonify({"from_ts": from_ts, "to_ts": to_ts, "stats": stats})
 
+    @app.route("/api/channel-sources")
+    @any_role_required
+    def api_channel_sources(role="viewer"):
+        return jsonify({"channels": _load_channel_sources()})
+
+    @app.route("/api/channel-sources", methods=["POST"])
+    @admin_required
+    def api_channel_sources_update(role="admin"):
+        payload = request.get_json(silent=True) or {}
+        raw_channels = payload.get("channels") or {}
+        config = _load_channel_sources()
+        for ch in CHANNELS:
+            if ch["id"] in raw_channels:
+                config[ch["id"]] = _normalize_channel_source(ch["id"], raw_channels.get(ch["id"]))
+
+        errors = _validate_channel_sources(config)
+        if errors:
+            return jsonify({"error": "validation_failed", "message": "invalid channel source settings", "errors": errors}), 400
+
+        results = _apply_channel_sources(config)
+        return jsonify({"status": "ok", "channels": _load_channel_sources(), "results": results})
+
     @app.route("/api/health")
     @any_role_required
     def health(role="viewer"):
@@ -1968,31 +2218,21 @@ def create_app(hub: AlertHub):
     @app.route("/api/channels/<channel_id>/restart", methods=["POST"])
     @admin_required
     def restart_channel(channel_id, role="admin"):
-        """Admin-only: restart a preview channel service."""
+        """Admin-only: restart preview + inference services for a channel."""
         valid_ids = {ch["id"] for ch in CHANNELS}
         if channel_id not in valid_ids:
             return jsonify({"error": "not_found", "message": f"Unknown channel: {channel_id}"}), 404
 
-        service_name = f"elevator-preview-{channel_id}.service"
-        logger.info("Admin requested restart of %s", service_name)
-
+        logger.info("Admin requested restart of channel %s", channel_id)
         try:
-            result = subprocess.run(
-                ["systemctl", "--user", "restart", service_name],
-                capture_output=True, text=True, timeout=15,
-            )
-            if result.returncode == 0:
-                logger.info("Manual restart of %s succeeded", service_name)
-                return jsonify({"status": "ok", "message": f"{service_name} restarted successfully"})
-            else:
-                logger.error("Manual restart of %s failed (rc=%d): %s", service_name, result.returncode, result.stderr.strip())
-                return jsonify({
-                    "error": "restart_failed",
-                    "message": f"systemctl returned {result.returncode}",
-                    "stderr": result.stderr.strip(),
-                }), 500
+            ok, message = _restart_channel_services(channel_id, _load_channel_sources())
+            if ok:
+                logger.info("Manual restart of %s succeeded: %s", channel_id, message)
+                return jsonify({"status": "ok", "message": message})
+            logger.error("Manual restart of %s failed: %s", channel_id, message)
+            return jsonify({"error": "restart_failed", "message": message}), 500
         except Exception as exc:
-            logger.error("Manual restart of %s raised exception: %s", service_name, exc)
+            logger.error("Manual restart of %s raised exception: %s", channel_id, exc)
             return jsonify({"error": "exception", "message": str(exc)}), 500
 
     return app

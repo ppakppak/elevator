@@ -36,3 +36,4 @@ deepstream_pose/logs/
 events.db
 cattle_dashboard/
 runtime/
+channel_sources.json
