@@ -108,6 +108,21 @@ class PreviewServer:
                 self._open_capture()
                 continue
 
+            if not self.is_live:
+                overlay = self._load_overlay() or {}
+                target_frame = overlay.get('source_frame_index')
+                try:
+                    target_frame = int(target_frame)
+                except (TypeError, ValueError):
+                    target_frame = None
+                if target_frame is not None and target_frame >= 0:
+                    try:
+                        current_frame = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
+                    except Exception:
+                        current_frame = target_frame
+                    if abs(current_frame - target_frame) > 1:
+                        self.cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+
             ok, frame = self.cap.read()
             if not ok:
                 if not self.is_live and self.cap is not None and self.cap.isOpened():

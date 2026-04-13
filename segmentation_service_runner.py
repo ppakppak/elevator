@@ -124,7 +124,7 @@ class SegmentationServiceRunner:
         payload.update(extra)
         self._write_overlay(payload, force=True)
 
-    def _process_frame(self, frame):
+    def _process_frame(self, frame, source_frame_index=None):
         frame_height, frame_width = frame.shape[:2]
         detections = self.detector.process_frame(frame, frame_number=self.frame_count)
 
@@ -171,6 +171,7 @@ class SegmentationServiceRunner:
                 "active": True,
                 "source": self.args.source,
                 "frame_count": self.processed_count,
+                "source_frame_index": int(source_frame_index) if source_frame_index is not None else self.frame_count,
                 "source_width": frame_width,
                 "source_height": frame_height,
                 "person_count": person_count,
@@ -219,10 +220,16 @@ class SegmentationServiceRunner:
 
                 self.frame_count += 1
                 self._sync_file_playback()
+                source_frame_index = None
+                if not self.is_live and self.cap is not None:
+                    try:
+                        source_frame_index = max(0, int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1)
+                    except Exception:
+                        source_frame_index = None
                 if self.args.frame_skip > 1 and (self.frame_count % self.args.frame_skip) != 0:
                     continue
 
-                self._process_frame(frame)
+                self._process_frame(frame, source_frame_index=source_frame_index)
         finally:
             self._publish_status(False, note="stopped")
             if self.cap is not None:
