@@ -111,6 +111,8 @@ SYSTEMD_USER_DIR = Path.home() / ".config/systemd/user"
 OVERLAY_DIR = Path("/home/ppak/projects/elevator/runtime/overlays")
 PREVIEW_CAPTURE_OPTIONS = "rtsp_transport;udp|fflags;nobuffer|flags;low_delay|max_delay;500000|reorder_queue_size;0"
 SOURCE_TYPE_CHOICES = ("disabled", "rtsp", "file", "webcam")
+DEFAULT_INFERENCE_BACKEND = "deepstream_resnet10"
+INFERENCE_BACKEND_CHOICES = ("deepstream_resnet10", "yolo_seg_best_m")
 CHANNEL_BY_ID = {ch["id"]: ch for ch in CHANNELS}
 
 
@@ -133,16 +135,25 @@ def _default_channel_sources() -> Dict[str, Dict[str, Any]]:
             "name": ch["name"],
             "sourceType": "disabled",
             "source": "",
+            "backend": DEFAULT_INFERENCE_BACKEND,
             "enabled": False,
         }
         for ch in CHANNELS
     }
 
 
+def _normalize_inference_backend(value: Any) -> str:
+    backend = str(value or "").strip().lower()
+    if backend not in INFERENCE_BACKEND_CHOICES:
+        return DEFAULT_INFERENCE_BACKEND
+    return backend
+
+
 def _normalize_channel_source(channel_id: str, raw: Any) -> Dict[str, Any]:
     entry = raw if isinstance(raw, dict) else {}
     source = str(entry.get("source") or "").strip()
     source_type = str(entry.get("sourceType") or "").strip().lower()
+    backend = _normalize_inference_backend(entry.get("backend"))
     if source_type not in SOURCE_TYPE_CHOICES:
         source_type = _infer_source_type(source)
     enabled = source_type != "disabled" and bool(source)
@@ -151,6 +162,7 @@ def _normalize_channel_source(channel_id: str, raw: Any) -> Dict[str, Any]:
         "name": CHANNEL_BY_ID[channel_id]["name"],
         "sourceType": source_type if enabled else "disabled",
         "source": source if enabled else "",
+        "backend": backend,
         "enabled": enabled,
     }
 
@@ -179,6 +191,7 @@ def _save_channel_sources(config: Dict[str, Dict[str, Any]]) -> None:
         ch["id"]: {
             "sourceType": config[ch["id"]]["sourceType"],
             "source": config[ch["id"]]["source"],
+            "backend": config[ch["id"]]["backend"],
         }
         for ch in CHANNELS
     }
@@ -260,6 +273,49 @@ WantedBy=default.target
 '''
 
 
+def _seg_service_text(channel: Dict[str, Any], source_type: str, source: str, seg_model: str = "m") -> str:
+    overlay_json = OVERLAY_DIR / f"{channel['id']}.json"
+    seg_source = f"http://127.0.0.1:{channel['port']}/video_feed" if source_type == "webcam" else source
+    extra_unit = ""
+    extra_service = ""
+    if source_type == "webcam":
+        extra_unit = (
+            f"After=network-online.target elevator-preview-{channel['id']}.service\n"
+            "Wants=network-online.target\n"
+            f"Requires=elevator-preview-{channel['id']}.service\n"
+            f"PartOf=elevator-preview-{channel['id']}.service\n"
+        )
+        extra_service = "ExecStartPre=/bin/sleep 2\n"
+    else:
+        extra_unit = "After=network-online.target\nWants=network-online.target\n"
+    return f'''[Unit]
+Description=Elevator inference channel: elevator-ds-{channel['id']}.service (YOLO segmentation)
+{extra_unit}
+[Service]
+Type=simple
+WorkingDirectory=/home/ppak/projects/elevator
+Environment=PYTHONUNBUFFERED=1
+Environment=OPENCV_FFMPEG_CAPTURE_OPTIONS={PREVIEW_CAPTURE_OPTIONS}
+# Operator note: keep service name/log path stable so dashboard log tailing still works
+# while a single channel is rolled over from DeepStream to best_m.
+{extra_service}ExecStart=/home/ppak/projects/elevator/venv/bin/python /home/ppak/projects/elevator/segmentation_service_runner.py --source {_quote_unit_arg(seg_source)} --overlay-json {_quote_unit_arg(str(overlay_json))} --frame-skip 1 --conf 0.3 --device auto --imgsz 384 --seg-model {seg_model}
+Restart=always
+RestartSec=3
+StandardOutput=append:/home/ppak/projects/elevator/deepstream_pose/logs/elevator-ds-{channel['id']}.out.log
+StandardError=append:/home/ppak/projects/elevator/deepstream_pose/logs/elevator-ds-{channel['id']}.err.log
+
+[Install]
+WantedBy=default.target
+'''
+
+
+def _inference_service_text(channel: Dict[str, Any], entry: Dict[str, Any]) -> str:
+    backend = entry.get("backend") or DEFAULT_INFERENCE_BACKEND
+    if backend == "yolo_seg_best_m":
+        return _seg_service_text(channel, entry["sourceType"], entry["source"], seg_model="m")
+    return _ds_service_text(channel, entry["sourceType"], entry["source"])
+
+
 def _restart_channel_services(channel_id: str, config: Optional[Dict[str, Dict[str, Any]]] = None) -> Tuple[bool, str]:
     config = config or _load_channel_sources()
     if channel_id not in config:
@@ -274,7 +330,7 @@ def _restart_channel_services(channel_id: str, config: Optional[Dict[str, Dict[s
     OVERLAY_DIR.mkdir(parents=True, exist_ok=True)
     if entry["enabled"]:
         preview_path.write_text(_preview_service_text(channel, entry["source"]))
-        ds_path.write_text(_ds_service_text(channel, entry["sourceType"], entry["source"]))
+        ds_path.write_text(_inference_service_text(channel, entry))
 
     subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True, text=True, timeout=20)
 
@@ -290,7 +346,7 @@ def _restart_channel_services(channel_id: str, config: Optional[Dict[str, Dict[s
     ds_result = subprocess.run(["systemctl", "--user", "restart", ds_service], capture_output=True, text=True, timeout=20)
     if ds_result.returncode != 0:
         return False, f"inference restart failed: {ds_result.stderr.strip()}"
-    return True, f"{channel_id} applied ({entry['sourceType']})"
+    return True, f"{channel_id} applied ({entry['sourceType']}, {entry['backend']})"
 
 
 def _validate_channel_sources(config: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
@@ -298,6 +354,10 @@ def _validate_channel_sources(config: Dict[str, Dict[str, Any]]) -> Dict[str, st
     for channel_id, entry in config.items():
         source_type = entry["sourceType"]
         source = entry["source"]
+        backend = entry.get("backend") or DEFAULT_INFERENCE_BACKEND
+        if backend not in INFERENCE_BACKEND_CHOICES:
+            errors[channel_id] = "backend must be a supported inference backend"
+            continue
         if source_type == "disabled":
             continue
         if not source:
@@ -846,7 +906,7 @@ HTML = """
       <div class="card">
         <div class="card-header">
           <h3>🎛️ 채널 입력 소스 설정</h3>
-          <span class="badge">preview + inference 공통 적용</span>
+          <span class="badge">preview + inference backend 적용</span>
         </div>
         <div class="controls-body">
           <div id="sourceConfigBody">로딩중...</div>
@@ -923,25 +983,38 @@ function sourceHint(type){
   return 'disabled면 서비스를 중지합니다';
 }
 
+function backendHint(backend){
+  if(backend === 'yolo_seg_best_m') return 'YOLO segmentation best_m. staged rollout용으로 채널별 전환 가능';
+  return '기존 DeepStream resnet10 경로. 기존 설정과 호환됩니다';
+}
+
 function renderSourceConfig(){
   const box = document.getElementById('sourceConfigBody');
   if(!box) return;
   const isAdmin = userRole === 'admin';
   box.innerHTML = channels.map(ch => {
-    const cfg = state.channelSources[ch.id] || {sourceType:'disabled', source:''};
-    const options = [
+    const cfg = state.channelSources[ch.id] || {sourceType:'disabled', source:'', backend:'deepstream_resnet10'};
+    const sourceOptions = [
       ['disabled', '비활성'],
       ['rtsp', 'RTSP'],
       ['file', '파일'],
       ['webcam', '웹캠'],
     ].map(([value, label]) => `<option value="${value}" ${cfg.sourceType === value ? 'selected' : ''}>${label}</option>`).join('');
+    const backendOptions = [
+      ['deepstream_resnet10', 'DeepStream resnet10'],
+      ['yolo_seg_best_m', 'YOLO best_m segmentation'],
+    ].map(([value, label]) => `<option value="${value}" ${cfg.backend === value ? 'selected' : ''}>${label}</option>`).join('');
     return `
       <div style="padding:10px 0; border-top:1px solid var(--border);">
         <div style="font-size:12px; font-weight:700; margin-bottom:8px;">${ch.name}</div>
-        <div class="filter-grid" style="grid-template-columns: 120px 1fr;">
+        <div class="filter-grid" style="grid-template-columns: 120px 180px 1fr;">
           <div class="field">
             <label>타입</label>
-            <select data-source-type="${ch.id}" ${isAdmin ? '' : 'disabled'}>${options}</select>
+            <select data-source-type="${ch.id}" ${isAdmin ? '' : 'disabled'}>${sourceOptions}</select>
+          </div>
+          <div class="field">
+            <label>추론 백엔드</label>
+            <select data-source-backend="${ch.id}" ${isAdmin ? '' : 'disabled'}>${backendOptions}</select>
           </div>
           <div class="field">
             <label>입력 소스</label>
@@ -949,6 +1022,7 @@ function renderSourceConfig(){
           </div>
         </div>
         <div class="source-hint" style="margin-top:6px; color:var(--text-muted); font-size:11px;">${sourceHint(cfg.sourceType)}</div>
+        <div class="backend-hint" style="margin-top:4px; color:var(--text-muted); font-size:11px;">${backendHint(cfg.backend)}</div>
       </div>
     `;
   }).join('');
@@ -965,6 +1039,15 @@ function renderSourceConfig(){
       const hint = wrapper ? wrapper.querySelector('.source-hint') : null;
       if(input) input.placeholder = sourceHint(ev.target.value);
       if(hint) hint.textContent = sourceHint(ev.target.value);
+    });
+  });
+
+  box.querySelectorAll('select[data-source-backend]').forEach(sel => {
+    sel.addEventListener('change', (ev) => {
+      const channelId = ev.target.dataset.sourceBackend;
+      const wrapper = ev.target.closest('div[style*="border-top"]');
+      const hint = wrapper ? wrapper.querySelector('.backend-hint') : null;
+      if(hint) hint.textContent = backendHint(ev.target.value);
     });
   });
 }
@@ -991,6 +1074,10 @@ function collectSourceConfig(){
     next[ch.id] = {
       sourceType: typeEl ? typeEl.value : 'disabled',
       source: valueEl ? valueEl.value.trim() : '',
+      backend: (() => {
+        const backendEl = document.querySelector(`[data-source-backend="${ch.id}"]`);
+        return backendEl ? backendEl.value : 'deepstream_resnet10';
+      })(),
     };
   });
   return next;
