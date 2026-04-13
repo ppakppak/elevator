@@ -19,6 +19,7 @@ import cv2
 from detector_segmentation import create_detector
 
 OVERLAY_INTERVAL_SEC = 0.12
+FILE_PLAYBACK_FPS = 15.0  # mirror preview_server.py for file playback sync
 LIVE_SCHEMES = ("rtsp://", "rtmp://", "udp://", "http://", "https://")
 
 
@@ -50,6 +51,8 @@ class SegmentationServiceRunner:
         self.fight_count = 0
         self._last_overlay_write_ts = 0.0
         self.is_live = _is_live_source(args.source)
+        self.file_frame_interval_sec = 0.0 if self.is_live else (1.0 / FILE_PLAYBACK_FPS)
+        self._next_frame_due_ts = None
 
         signal.signal(signal.SIGINT, self._handle_stop)
         signal.signal(signal.SIGTERM, self._handle_stop)
@@ -92,6 +95,19 @@ class SegmentationServiceRunner:
                     tmp_path.unlink()
                 except FileNotFoundError:
                     pass
+
+    def _sync_file_playback(self):
+        if self.file_frame_interval_sec <= 0:
+            return
+        now = time.monotonic()
+        if self._next_frame_due_ts is None:
+            self._next_frame_due_ts = now + self.file_frame_interval_sec
+            return
+        sleep_for = self._next_frame_due_ts - now
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+        now = time.monotonic()
+        self._next_frame_due_ts = max(self._next_frame_due_ts + self.file_frame_interval_sec, now)
 
     def _publish_status(self, active: bool, **extra):
         payload = {
@@ -202,6 +218,7 @@ class SegmentationServiceRunner:
                     continue
 
                 self.frame_count += 1
+                self._sync_file_playback()
                 if self.args.frame_skip > 1 and (self.frame_count % self.args.frame_skip) != 0:
                     continue
 
