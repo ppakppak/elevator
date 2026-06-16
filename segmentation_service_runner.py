@@ -18,7 +18,7 @@ import cv2
 
 from detector_segmentation import create_detector
 
-OVERLAY_INTERVAL_SEC = 0.12
+OVERLAY_INTERVAL_SEC = 0.05  # faster preview sync for file sources
 FILE_PLAYBACK_FPS = 15.0  # mirror preview_server.py for file playback sync
 LIVE_SCHEMES = ("rtsp://", "rtmp://", "udp://", "http://", "https://")
 
@@ -53,6 +53,11 @@ class SegmentationServiceRunner:
         self.is_live = _is_live_source(args.source)
         self.file_frame_interval_sec = 0.0 if self.is_live else (1.0 / FILE_PLAYBACK_FPS)
         self._next_frame_due_ts = None
+        self.resize_width = args.resize_width
+        self.preview_frame_path = None
+        if self.overlay_json:
+            self.preview_frame_path = self.overlay_json.parent.parent / "frames" / f"{self.overlay_json.stem}.jpg"
+            self.preview_frame_path.parent.mkdir(parents=True, exist_ok=True)
 
         signal.signal(signal.SIGINT, self._handle_stop)
         signal.signal(signal.SIGTERM, self._handle_stop)
@@ -85,7 +90,8 @@ class SegmentationServiceRunner:
             ) as tmp:
                 json.dump(payload, tmp, ensure_ascii=False)
                 tmp.flush()
-                os.fsync(tmp.fileno())
+                # No fsync here: this file is a live preview/status handoff, not durable state.
+                # fsync per frame throttles Jetson file-source preview and AI/overlay sync.
                 tmp_path = Path(tmp.name)
             os.replace(tmp_path, self.overlay_json)
             self._last_overlay_write_ts = now
@@ -108,6 +114,29 @@ class SegmentationServiceRunner:
             time.sleep(sleep_for)
         now = time.monotonic()
         self._next_frame_due_ts = max(self._next_frame_due_ts + self.file_frame_interval_sec, now)
+
+    def _write_preview_frame(self, frame):
+        if self.preview_frame_path is None:
+            return None
+        ok, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        if not ok:
+            return None
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "wb", delete=False, dir=str(self.preview_frame_path.parent), suffix=".jpg.tmp"
+            ) as tmp:
+                tmp.write(buf.tobytes())
+                tmp.flush()
+                tmp_path = Path(tmp.name)
+            os.replace(tmp_path, self.preview_frame_path)
+            return str(self.preview_frame_path)
+        finally:
+            if tmp_path and tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except FileNotFoundError:
+                    pass
 
     def _publish_status(self, active: bool, **extra):
         payload = {
@@ -166,24 +195,26 @@ class SegmentationServiceRunner:
         self.processed_count += 1
         elapsed = max(time.time() - self.start_time, 1e-6)
         fps = self.processed_count / elapsed
-        self._write_overlay(
-            {
-                "active": True,
-                "source": self.args.source,
-                "frame_count": self.processed_count,
-                "source_frame_index": int(source_frame_index) if source_frame_index is not None else self.frame_count,
-                "source_width": frame_width,
-                "source_height": frame_height,
-                "person_count": person_count,
-                "fallen_now": fallen_now,
-                "fall_count": self.fall_count,
-                "fight_count": self.fight_count,
-                "fight_active": fight_now > 0,
-                "fight_confidence": round(max_fight_conf, 3),
-                "fps": round(fps, 2),
-                "boxes": boxes,
-            }
-        )
+        preview_frame_jpeg = self._write_preview_frame(frame)
+        payload = {
+            "active": True,
+            "source": self.args.source,
+            "frame_count": self.processed_count,
+            "source_frame_index": int(source_frame_index) if source_frame_index is not None else self.frame_count,
+            "source_width": frame_width,
+            "source_height": frame_height,
+            "person_count": person_count,
+            "fallen_now": fallen_now,
+            "fall_count": self.fall_count,
+            "fight_count": self.fight_count,
+            "fight_active": fight_now > 0,
+            "fight_confidence": round(max_fight_conf, 3),
+            "fps": round(fps, 2),
+            "boxes": boxes,
+        }
+        if preview_frame_jpeg:
+            payload["preview_frame_jpeg"] = preview_frame_jpeg
+        self._write_overlay(payload)
 
     def run(self):
         self.cap = self._open_capture()
@@ -218,8 +249,12 @@ class SegmentationServiceRunner:
                             print(f"경고: 소스 재연결 실패: {exc}", flush=True)
                     continue
 
+                # 프레임 리사이즈 (전처리/후처리 가속)
+                if self.resize_width > 0 and frame.shape[1] > self.resize_width:
+                    scale = self.resize_width / frame.shape[1]
+                    frame = cv2.resize(frame, (self.resize_width, int(frame.shape[0] * scale)))
+
                 self.frame_count += 1
-                self._sync_file_playback()
                 source_frame_index = None
                 if not self.is_live and self.cap is not None:
                     try:
@@ -247,6 +282,7 @@ def build_parser():
     parser.add_argument("--device", default="auto", help="inference device (auto, cpu, cuda, 0, ...)")
     parser.add_argument("--imgsz", type=int, default=384, help="YOLO segmentation inference size")
     parser.add_argument("--seg-model", default="m", choices=["m", "l"], help="best_<size> model variant")
+    parser.add_argument("--resize-width", type=int, default=640, help="resize frame width before inference (0=no resize)")
     return parser
 
 

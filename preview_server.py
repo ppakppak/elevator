@@ -17,7 +17,6 @@ class PreviewServer:
         self.width = width
         self.jpeg_quality = jpeg_quality
         self.overlay_json = Path(overlay_json).expanduser() if overlay_json else None
-        self.follow_ai = bool(follow_ai)
         self.app = Flask(__name__)
         self.cap = None
         self.frame = None
@@ -30,6 +29,9 @@ class PreviewServer:
 
         src = str(source).lower()
         self.is_live = src.isdigit() or src.startswith(("rtsp://", "rtmp://", "udp://", "http://", "https://"))
+        # File previews default to AI-follow mode so boxes stay frame-synced.
+        # Use --independent-file only when smooth raw playback matters more than overlay sync.
+        self.follow_ai = (not self.is_live) if follow_ai is None else bool(follow_ai)
 
         self._setup_routes()
 
@@ -112,6 +114,26 @@ class PreviewServer:
 
             if self.follow_ai and not self.is_live:
                 overlay = self._load_overlay() or {}
+                preview_frame_jpeg = overlay.get('preview_frame_jpeg')
+                overlay_key = (
+                    overlay.get('source_frame_index'),
+                    overlay.get('updated_at'),
+                    preview_frame_jpeg,
+                )
+                if preview_frame_jpeg and overlay_key != last_seeked_frame:
+                    frame = cv2.imread(str(preview_frame_jpeg))
+                    if frame is not None:
+                        frame = self._draw_overlay(frame)
+                        with self.lock:
+                            self.frame = frame
+                            self.frame_count += 1
+                        last_seeked_frame = overlay_key
+                        time.sleep(0.001)
+                        continue
+                elif preview_frame_jpeg:
+                    time.sleep(0.005)
+                    continue
+
                 target_frame = overlay.get('source_frame_index')
                 try:
                     target_frame = int(target_frame)
@@ -235,7 +257,8 @@ def main():
     p.add_argument('--width', type=int, default=640)
     p.add_argument('--jpeg-quality', type=int, default=70)
     p.add_argument('--overlay-json')
-    p.add_argument('--follow-ai', action='store_true', help='For file sources, seek/wait to match the latest AI overlay frame. Default: play files independently for smoother preview.')
+    p.add_argument('--follow-ai', dest='follow_ai', action='store_true', default=None, help='For file sources, seek/wait to match the latest AI overlay frame. This is the default for files.')
+    p.add_argument('--independent-file', dest='follow_ai', action='store_false', help='For file sources, play the video independently from AI overlay frames.')
     args = p.parse_args()
 
     PreviewServer(
