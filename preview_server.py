@@ -10,13 +10,14 @@ from flask import Flask, Response, jsonify
 
 
 class PreviewServer:
-    def __init__(self, source, host='0.0.0.0', port=5000, width=640, jpeg_quality=70, overlay_json=None):
+    def __init__(self, source, host='0.0.0.0', port=5000, width=640, jpeg_quality=70, overlay_json=None, follow_ai=False):
         self.source = source
         self.host = host
         self.port = port
         self.width = width
         self.jpeg_quality = jpeg_quality
         self.overlay_json = Path(overlay_json).expanduser() if overlay_json else None
+        self.follow_ai = bool(follow_ai)
         self.app = Flask(__name__)
         self.cap = None
         self.frame = None
@@ -102,13 +103,14 @@ class PreviewServer:
 
     def _reader(self):
         self._open_capture()
+        last_seeked_frame = -1
         while self.running:
             if self.cap is None or not self.cap.isOpened():
                 time.sleep(0.2)
                 self._open_capture()
                 continue
 
-            if not self.is_live:
+            if self.follow_ai and not self.is_live:
                 overlay = self._load_overlay() or {}
                 target_frame = overlay.get('source_frame_index')
                 try:
@@ -116,18 +118,26 @@ class PreviewServer:
                 except (TypeError, ValueError):
                     target_frame = None
                 if target_frame is not None and target_frame >= 0:
-                    try:
-                        current_frame = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
-                    except Exception:
-                        current_frame = target_frame
-                    if abs(current_frame - target_frame) > 1:
-                        self.cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+                    # target_frame이 변했을 때만 seek (불필요한 H.264 seek 방지)
+                    if target_frame != last_seeked_frame:
+                        try:
+                            current_frame = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
+                        except Exception:
+                            current_frame = target_frame
+                        if abs(current_frame - target_frame) > 1:
+                            self.cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+                        last_seeked_frame = target_frame
+                    else:
+                        # 추론이 새 프레임을 아직 안 만들었으면 대기
+                        time.sleep(1 / 15)
+                        continue
 
             ok, frame = self.cap.read()
             if not ok:
                 if not self.is_live and self.cap is not None and self.cap.isOpened():
                     self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    time.sleep(0.01)
+                    last_seeked_frame = -1
+                    time.sleep(0.5)
                     continue
                 time.sleep(0.02)
                 continue
@@ -179,6 +189,18 @@ class PreviewServer:
 
             return Response(gen(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
+        @self.app.route('/snapshot')
+        def snapshot():
+            # 알림용 단일 JPEG (현재 오버레이 포함). lock은 프레임 복사만 잡음.
+            with self.lock:
+                frame = None if self.frame is None else self.frame.copy()
+            if frame is None:
+                return Response("no frame", status=503, mimetype='text/plain')
+            ok, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
+            if not ok:
+                return Response("encode fail", status=500, mimetype='text/plain')
+            return Response(buf.tobytes(), mimetype='image/jpeg')
+
         @self.app.route('/stats')
         def stats():
             elapsed = max(time.time() - self.start_time, 1e-6)
@@ -193,6 +215,9 @@ class PreviewServer:
                 'overlay_fresh': updated_at > 0 and (time.time() - updated_at) < 2.0,
                 'person_count': int(overlay.get('person_count', 0) or 0),
                 'fight_active': bool(overlay.get('fight_active', False)),
+                'is_live': self.is_live,
+                'follow_ai': self.follow_ai,
+                'playback_mode': 'follow_ai' if self.follow_ai and not self.is_live else ('live' if self.is_live else 'independent_file'),
             })
 
     def run(self):
@@ -210,6 +235,7 @@ def main():
     p.add_argument('--width', type=int, default=640)
     p.add_argument('--jpeg-quality', type=int, default=70)
     p.add_argument('--overlay-json')
+    p.add_argument('--follow-ai', action='store_true', help='For file sources, seek/wait to match the latest AI overlay frame. Default: play files independently for smoother preview.')
     args = p.parse_args()
 
     PreviewServer(
@@ -219,6 +245,7 @@ def main():
         width=args.width,
         jpeg_quality=args.jpeg_quality,
         overlay_json=args.overlay_json,
+        follow_ai=args.follow_ai,
     ).run()
 
 
